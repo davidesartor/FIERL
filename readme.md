@@ -41,7 +41,7 @@ Optional params:
 - `len` (int): length of the simulation/episode to run. Default is 120. 
 - `episodes` (int): number of simulations to run. Default is 1. 
 - `norender`: disable the render of the environment
-- `faults_list` (list): list of faults. Example of correct form --faults [[1, 2, 3], [4, 5, 6], [7, 8, 9]]. If None, then random faults are generated. Default is None.
+- `faults_list` (list): list of faults. Example of correct form --faults_list [[1, 2, 3], [4, 5, 6], [7, 8, 9]]. If None, then random faults are generated. Default is None.
 - `fault_change_step` (int): number of fixed steps between fault changes. If None, the steps of the changes are randomly sampled. Default is None. 
 - `faults_number` (int): number of faults to change within an episode. Default is None. 
 - `min_steps` (int): minimum number of steps between fault changes. Needed only if `fault_change_step` is None and `faults_list` is None. Default is None.
