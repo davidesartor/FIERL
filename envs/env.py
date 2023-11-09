@@ -165,7 +165,7 @@ class Env:
             if self.ic_type == 'normal': 
                 return np.random.normal(self.ic_mean, self.ic_std)
             elif self.ic_type == 'uniform_component': 
-                return np.array([[random.uniform(self.ic_mean[i], self.ic_std[i]) for i in range(self.system.state_dim)]])
+                return np.array([random.uniform(self.ic_mean[i]-self.ic_std,self.ic_mean[i]+self.ic_std ) for i in range(self.system.state_dim)])
             elif self.ic_type == 'uniform_sphere': 
                 return sample_uniformly_from_ball(self.ic_mean, self.ic_std, self.system.state_dim)
             else: 
