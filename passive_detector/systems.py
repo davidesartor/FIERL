@@ -9,8 +9,8 @@ class DSSM(struct.PyTreeNode):
     B: jax.Array
     C: jax.Array
     D: jax.Array
-    noise_std_x: jax.Array
-    noise_std_y: jax.Array
+    noise_cov_x: jax.Array
+    noise_cov_y: jax.Array
     dt: float
 
     @property
@@ -26,36 +26,59 @@ class DSSM(struct.PyTreeNode):
         return self.C.shape[0]
 
     @classmethod
+    def from_discrete(
+        cls,
+        A: jax.Array,
+        B: jax.Array,
+        C: jax.Array,
+        D: jax.Array | None,
+        noise_cov_x: jax.Array | float,
+        noise_cov_y: jax.Array | float,
+        dt: float,
+    ):
+        if isinstance(noise_cov_x, (int, float)):
+            noise_cov_x = noise_cov_x * jnp.eye(A.shape[0])
+        if isinstance(noise_cov_y, (int, float)):
+            noise_cov_y = noise_cov_y * jnp.eye(C.shape[0])
+        D = D if D is not None else jnp.zeros((C.shape[0], B.shape[1]))
+        return cls(A, B, C, D, noise_cov_x, noise_cov_y, dt)
+
+    @classmethod
     def from_continuos(
         cls,
         A: jax.Array,
         B: jax.Array,
         C: jax.Array,
         D: jax.Array | None,
-        noise_std_x: jax.Array,
-        noise_std_y: jax.Array,
+        noise_cov_x: jax.Array | float,
+        noise_cov_y: jax.Array | float,
         dt: float = 1.0,
     ):
-        D = D or jnp.zeros((C.shape[0], B.shape[1]))
+        D = D if D is not None else jnp.zeros((C.shape[0], B.shape[1]))
         continuos_ssm = lti(A, B, C, D).to_discrete(dt)
         A_d = jnp.array(continuos_ssm.A)  # type: ignore
         B_d = jnp.array(continuos_ssm.B)  # type: ignore
         C_d = jnp.array(continuos_ssm.C)  # type: ignore
         D_d = jnp.array(continuos_ssm.D)  # type: ignore
-        return cls(A_d, B_d, C_d, D_d, noise_std_x * jnp.sqrt(dt), noise_std_y, dt)
+        if isinstance(noise_cov_x, (int, float)):
+            noise_cov_x = noise_cov_x * jnp.eye(A.shape[0])
+        if isinstance(noise_cov_y, (int, float)):
+            noise_cov_y = noise_cov_y * jnp.eye(C.shape[0])
+        return cls(A_d, B_d, C_d, D_d, noise_cov_x * dt, noise_cov_y, dt)
 
-    def step(self, x: jax.Array, rng_key: jax.Array, u: jax.Array):
+    def step(self, x: jax.Array, u: jax.Array, rng_key=jax.random.PRNGKey(0)):
         rng_noise_x, rng_noise_y = jax.random.split(rng_key)
         w_x = jax.random.normal(rng_noise_x, (self.state_dim,))
         w_y = jax.random.normal(rng_noise_y, (self.output_dim,))
-        y = self.C @ x + self.D @ u + self.noise_std_y * w_y
-        new_x = self.A @ x + self.B @ u + self.noise_std_x * w_x
+        y = self.C @ x + self.D @ u + self.noise_cov_y @ w_y
+        new_x = self.A @ x + self.B @ u + self.noise_cov_x @ w_x
         return new_x, y
 
-    def simulate(self, x0: jax.Array, rng_key: jax.Array, u_t: jax.Array):
+    @jax.jit
+    def simulate(self, x0: jax.Array, u_t: jax.Array, rng_key=jax.random.PRNGKey(0)):
         def scan_fn(x, input):
             rng, u = input
-            new_x, y = self.step(x, rng, u)
+            new_x, y = self.step(x, u, rng)
             return new_x, (x, y)
 
         rng_steps = jax.random.split(rng_key, u_t.shape[0])
