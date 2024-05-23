@@ -4,36 +4,36 @@ import gymnasium as gym
 from gymnasium import spaces 
 import inspect
 from environment.utils import * 
+import inspect
 
 
 class Environment(gym.Env): 
     
-    def __init__(self, system, fault_observer, reference, track_threshold, initial_condition_fnc, fault_generator_fnc, fault_random_walk_std = None, is_train = True,  render_mode = None): 
+    def __init__(self, system, fault_observer, reference, track_threshold, initial_condition_fnc, fault_generator_fnc, max_ep_len, render_mode = None, observer_logger = None): 
         '''
         Args: 
-            system (object): system
+            system (object): system to be controlled
             fault_observer (object): fault observer
-            reference (np.ndarray): reference signal
-            track_threshold (float): threshold for tracking error
+            reference (np.ndarray): reference signal to track
+            track_threshold (float): threshold on tracking error
             initial_condition_fnc (callable): function to generate initial conditions of the system 
             fault_generator_fnc (callable): function to generate faults
-            fault_random_walk_std (float): standard deviation of the random walk of the fault
-            is_train (bool): whether the environment is in training mode
-            render_mode (str): render mode
+            max_ep_len (int): maximum episode length
+            render_mode (str, optional): render mode
+            observer_logger (object, optional): logger for the observer
         '''
+
+        super().__init__()
+      
         self.system = deepcopy(system)
         self.fault_observer = deepcopy(fault_observer)
-
+        self.observer_logger = deepcopy(observer_logger)
         self.reference = reference
         self.track_threshold = track_threshold
-
         self.initial_condition_fnc = initial_condition_fnc
         self.fault_generator_fnc = fault_generator_fnc
-
-        self.random_walk_std = fault_random_walk_std
-
-        self.is_train = is_train
-
+        self.max_ep_len = max_ep_len
+        self.render_mode = render_mode
 
         self.observation_space = spaces.Dict({
             'state_estimate': spaces.Box(low = -np.inf, high = np.inf, shape = (int(self.system.state_dim + 0.5 * self.system.state_dim * (self.system.state_dim + 1)),)),  # upper triangular matrix has n(n+1)/2 elements
@@ -41,32 +41,27 @@ class Environment(gym.Env):
             'reference': spaces.Box(low = -np.inf, high = np.inf, shape = (self.system.output_dim,)),
             'system_output': spaces.Box(low = -np.inf, high = np.inf, shape = (self.system.output_dim,)),
             })
-        
-        
-        self.env_obs_shape = (int(self.system.state_dim + 0.5 * self.system.state_dim * (self.system.state_dim + 1) + self.system.input_dim + 0.5 * self.system.input_dim * (self.system.input_dim + 1) + 2 * self.system.output_dim),)
         self.action_space = spaces.Box(low = self.system.min_input, high = self.system.max_input, shape = (self.system.input_dim,))
-
-        self.render_mode = render_mode
 
     
     def _get_obs(self): 
+        state_estimate, fault_estimate = self.fault_observer.split()
         return {
-            'state_estimate': [self.fault_observer.state_estimate.mean, upper_trinagular(self.fault_observer.state_estimate.cov)],
-            'fault_estimate': [self.fault_observer.fault_estimate.mean, upper_trinagular(self.fault_observer.fault_estimate.cov)],
+            'state_estimate': [state_estimate.mean, upper_trinagular(state_estimate.cov)],
+            'fault_estimate': [fault_estimate.mean, upper_trinagular(fault_estimate.cov)],
             'system_output': self.system.output, 
             'reference': self.reference[self.step_counter],
         }
     
 
-    def reset(self, seed = None, initial_fault = None, initial_state = None, observer_logger = None):
+    def reset(self, initial_fault = None, initial_state = None, seed = None):
         '''
-        Reset the environment to initial_fault and initial_state if not None, otherwise from the given function generator. 
+        Reset the environment.
         
         Args: 
+            initial_fault (np.ndarray): initial fault, shape (system.input_dim, )
+            initial_state (np.ndarray): initial state, shape (system.state_dim, )
             seed (int): seed for the environment
-            initial_fault (np.ndarray): initial fault
-            initial_state (np.ndarray): initial state
-            observer_logger (object): logger for the observer
         
         Returns: 
             np.ndarray: observation
@@ -76,56 +71,68 @@ class Environment(gym.Env):
 
         self.step_counter = 0
 
-        initial_state = self.initial_condition_fnc() if (initial_state is None or self.is_train) else initial_state
-        initial_fault = self.fault_generator_fnc() if (initial_fault is None or self.is_train) else initial_fault
+        initial_state = self.initial_condition_fnc() if initial_state is None else initial_state
         self.system.reset(initial_state.reshape((-1,1)))
+
+        initial_fault = self.fault_generator_fnc() if initial_fault is None else initial_fault
         self.system.set_fault(initial_fault)
+
         self.fault_observer.reset()
-        if observer_logger is not None: 
-            self.obs_logger = deepcopy(observer_logger)
-            self.obs_logger.log(self.system, self.fault_observer, None)
+        self.fault_observer.update(y = self.system.output, C = self.system.C, output_noise_cov = np.eye(self.system.output_dim) * self.system.output_noise_std**2,)
+
+        if self.observer_logger is not None: 
+            self.observer_logger.reset()
+            self.observer_logger.log(system = self.system, observer = self.fault_observer, control_input = None, reference = self.reference[self.step_counter])
 
         return flatten_and_extract_numbers(self._get_obs()), self._get_info()
     
 
     def step(self, action): 
         '''
-        Take a step in the environment by performing step in system and updating fault obaserver.
+        Take a step in the environment by performing step in system and updating fault observer.
         
         Args: 
             action (np.ndarray): action 
-            state_noise (np.ndarray): state noise. Default to None, meaning randomly generated noise
-            output_noise (np.ndarray): output noise. Default to None, meaning randomly generated noise
 
         Returns: 
-            tuple: observation, reward, done, info
+            tuple: observation, reward, terminated, truncated, info
         '''
+        action = np.clip(action, self.system.min_input, self.system.max_input)
         self.system.step(action.reshape((-1,1)))
-        self.fault_observer.update (A = self.system.A, B=self.system.B, control = action.reshape((-1,1)), state_noise_cov = np.eye(self.system.state_dim) * self.system.state_noise_std**2, 
-                                    C = self.system.C, output = self.system.output, output_noise_cov = np.eye(self.system.output_dim) * self.system.output_noise_std**2, fault_random_walk = self.random_walk_std) # controllare questo ultimo passo perchè è definito 
+        self.fault_observer.update(y = self.system.output, C = self.system.C, output_noise_cov = np.eye(self.system.output_dim) * self.system.output_noise_std**2, 
+                                    u = action.reshape((-1,1)), A = self.system.A, B=self.system.B, state_noise_cov = np.eye(self.system.state_dim) * self.system.state_noise_std**2)
+        if self.observer_logger is not None: 
+            # print('Logging')
+            self.observer_logger.log(system = self.system, observer = self.fault_observer, control_input = action.reshape((-1,1)), reference = self.reference[self.step_counter])
 
-    
         observation = flatten_and_extract_numbers(self._get_obs())  
         reward = self._get_reward()
         info = self._get_info()
 
         self.step_counter += 1
-        return observation, reward, False, False, info  #terminated and truncated are both False
+        if self.step_counter == self.max_ep_len: # truncate episode
+            info['final_observation'] = observation
+            return observation, reward, False, True, info
+        return observation, reward, False, False, info
         
-
     def _get_info(self): 
         return {'cost': self._get_cost(), 
                 'step_counter': self.step_counter,
                 'dict_state': self._get_obs()}
 
-    def render(self, mode = None): 
-        pass
+    def render(self, mode = None, save:bool = False, save_path:str = None): 
+        if self.observer_logger is not None: 
+            self.observer_logger.plot(save=save, save_path = save_path, track_threshold= self.track_threshold)
+        else: 
+            print('No observer logger found.')
     
     def close(self): 
         pass
 
     def _get_reward(self): 
-        return negative_expected_error_true(self.system.fault.reshape((-1,1)), self.fault_observer.fault_estimate.mean, self.fault_observer.fault_estimate.cov)
+        _, fault_estimate = self.fault_observer.split()
+        # print('reward', negative_expected_error_true(self.system.fault.reshape(-1,1), fault_estimate.mean, fault_estimate.cov).item())
+        return negative_expected_error_true(self.system.fault.reshape(-1,1), fault_estimate.mean, fault_estimate.cov).item()
 
     def _get_cost(self): 
         '''
