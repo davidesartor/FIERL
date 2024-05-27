@@ -35,9 +35,14 @@ class Environment(gym.Env):
         self.max_ep_len = max_ep_len
         self.render_mode = render_mode
 
+        if len(self.reference) != self.max_ep_len:
+            print('Reference signal length does not match episode length.')
+
+        state_fault_dim = self.system.state_dim + self.system.input_dim
         self.observation_space = spaces.Dict({
-            'state_estimate': spaces.Box(low = -np.inf, high = np.inf, shape = (int(self.system.state_dim + 0.5 * self.system.state_dim * (self.system.state_dim + 1)),)),  # upper triangular matrix has n(n+1)/2 elements
-            'fault_estimate': spaces.Box(low = -np.inf, high = np.inf, shape = (int(self.system.input_dim +  0.5 * self.system.input_dim * (self.system.input_dim + 1)),)),  # upper triangular matrix has n(n+1)/2 elements
+            # 'state_estimate': spaces.Box(low = -np.inf, high = np.inf, shape = (int(self.system.state_dim + 0.5 * self.system.state_dim * (self.system.state_dim + 1)),)),  # upper triangular matrix has n(n+1)/2 elements
+            # 'fault_estimate': spaces.Box(low = -np.inf, high = np.inf, shape = (int(self.system.input_dim +  0.5 * self.system.input_dim * (self.system.input_dim + 1)),)),  # upper triangular matrix has n(n+1)/2 elements
+            'state_fault_estimate': spaces.Box(low = -np.inf, high = np.inf, shape = (int(state_fault_dim + 0.5 * state_fault_dim * (state_fault_dim + 1) ),)),
             'reference': spaces.Box(low = -np.inf, high = np.inf, shape = (self.system.output_dim,)),
             'system_output': spaces.Box(low = -np.inf, high = np.inf, shape = (self.system.output_dim,)),
             })
@@ -45,10 +50,11 @@ class Environment(gym.Env):
 
     
     def _get_obs(self): 
-        state_estimate, fault_estimate = self.fault_observer.split()
+        # state_estimate, fault_estimate = self.fault_observer.split()
         return {
-            'state_estimate': [state_estimate.mean, upper_trinagular(state_estimate.cov)],
-            'fault_estimate': [fault_estimate.mean, upper_trinagular(fault_estimate.cov)],
+            # 'state_fault_estimate': [state_estimate.mean, upper_triangular(state_estimate.cov)],
+            # 'fault_estimate': [fault_estimate.mean, upper_triangular(fault_estimate.cov)],
+            'state_fault_estimate': [self.fault_observer.estimate.mean, upper_triangular(self.fault_observer.estimate.cov)],
             'system_output': self.system.output, 
             'reference': self.reference[self.step_counter],
         }
@@ -84,7 +90,7 @@ class Environment(gym.Env):
             self.observer_logger.reset()
             self.observer_logger.log(system = self.system, observer = self.fault_observer, control_input = None, reference = self.reference[self.step_counter])
 
-        return flatten_and_extract_numbers(self._get_obs()), self._get_info()
+        return np.expand_dims(flatten_and_extract_numbers(self._get_obs()), axis=0), self._get_info()
     
 
     def step(self, action): 
@@ -102,18 +108,22 @@ class Environment(gym.Env):
         self.fault_observer.update(y = self.system.output, C = self.system.C, output_noise_cov = np.eye(self.system.output_dim) * self.system.output_noise_std**2, 
                                     u = action.reshape((-1,1)), A = self.system.A, B=self.system.B, state_noise_cov = np.eye(self.system.state_dim) * self.system.state_noise_std**2)
         if self.observer_logger is not None: 
-            # print('Logging')
             self.observer_logger.log(system = self.system, observer = self.fault_observer, control_input = action.reshape((-1,1)), reference = self.reference[self.step_counter])
 
-        observation = flatten_and_extract_numbers(self._get_obs())  
-        reward = self._get_reward()
+        observation = np.expand_dims(flatten_and_extract_numbers(self._get_obs()), axis=0)
+        reward = np.expand_dims(self._get_reward(), axis=0)
         info = self._get_info()
+        info['cost'] = np.expand_dims(info['cost'], axis=0) 
+        terminated = np.expand_dims(False, axis=0)
+        truncated = np.expand_dims(False, axis=0)
 
         self.step_counter += 1
+        
         if self.step_counter == self.max_ep_len: # truncate episode
-            info['final_observation'] = observation
-            return observation, reward, False, True, info
-        return observation, reward, False, False, info
+            info['final_observation'] = observation #already expanded
+            truncated = np.expand_dims(True, axis=0)
+            return observation, reward, terminated, truncated, info
+        return observation, reward, terminated, truncated, info
         
     def _get_info(self): 
         return {'cost': self._get_cost(), 

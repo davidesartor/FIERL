@@ -25,6 +25,7 @@ import joblib
 import numpy as np
 import torch
 from torch.utils.tensorboard.writer import SummaryWriter
+import wandb
 
 # from safepo.common.mpi_tools import proc_id, mpi_statistics_scalar
 
@@ -108,7 +109,8 @@ class Logger:
         output_fname (str): The name of the output file. Default is "progress.csv".
         debug (bool): Toggle for debugging mode. Default is False.
         level (int): The logging level. Default is 1.
-        use_tensorboard (bool): Toggle for using TensorBoard logging. Default is True.
+        use_tensorboard (bool): Toggle for using TensorBoard logging. Default is True. 
+        use_wandb (bool): Toggle for using Weights & Biases logging. Default is False.
         verbose (bool): Toggle for verbose output. Default is True.
     """
 
@@ -120,6 +122,7 @@ class Logger:
         debug: bool = False,
         level: int = 1,
         use_tensorboard=True,
+        use_wandb=False,
         verbose=True,
     ):
         self.log_dir = log_dir
@@ -145,6 +148,7 @@ class Logger:
         )
         self.torch_saver_elements = None
         self.use_tensorboard = use_tensorboard
+        self.use_wandb = use_wandb
         self.logged = True
 
         # Setup tensor board logging if enabled and MPI root process
@@ -190,6 +194,9 @@ class Logger:
             % key
         )
         self.log_current_row[key] = val
+        
+        if self.use_wandb: 
+            wandb.log({key: val})
 
     def save_config(self, config):
         """
@@ -320,7 +327,8 @@ class EpochLogger(Logger):
         output_fname="progress.csv",
         debug: bool = False,
         level: int = 1,
-        use_tensorboard=True,
+        use_tensorboard=False,
+        use_wandb=False,
         verbose=True,
     ):
         super().__init__(
@@ -330,6 +338,7 @@ class EpochLogger(Logger):
             debug=debug,
             level=level,
             use_tensorboard=use_tensorboard,
+            use_wandb=use_wandb,
             verbose=verbose,
         )
         self.epoch_dict = dict()
@@ -365,6 +374,7 @@ class EpochLogger(Logger):
             if std:
                 super().log_tabular(key + "/Std", np.std(self.epoch_dict[key]))
         self.epoch_dict[key] = []
+
 
     def get_stats(self, key):
         """Get the values of a diagnostic."""

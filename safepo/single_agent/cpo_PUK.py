@@ -35,14 +35,10 @@ from torch.nn.utils.clip_grad import clip_grad_norm_
 from torch.utils.data import DataLoader, TensorDataset
 
 from safepo.common.buffer import VectorizedOnPolicyBuffer
-# from safepo.common.env import make_sa_mujoco_env, make_sa_isaac_env
+from safepo.common.env import make_sa_mujoco_env, make_sa_isaac_env
 from safepo.common.logger import EpochLogger
 from safepo.common.model import ActorVCritic
 from safepo.utils.config import single_agent_args, isaac_gym_map, parse_sim_params
-
-import gymnasium as gym 
-import wandb
-
 
 STEP_FRACTION=0.8
 CPO_SEARCHING_STEPS=15
@@ -55,7 +51,6 @@ default_cfg = {
     'batch_size': 128,
     'learning_iters': 10,
     'max_grad_norm': 40.0,
-    'critic_lr': 1e-3,
 }
 
 isaac_gym_specific_cfg = {
@@ -162,65 +157,47 @@ def fvp(
     return flat_grad_grad_kl + params * 0.1
 
 
-def train(env:object, args): 
-    '''
-    Train the agent using the CPO algorithm
-
-    Args: 
-
-        env (object): instance of the environment
-        args (dict): arguments passed to the function
-            * seed (int): seed for the random number generator
-            * device (str): device to use for training
-            * device_id (int): device id to use for training
-            * num_envs (int): number of environments to use for training
-            * config (dict): configuration dictionary
-                * hiddens_sizes (list): hidden layer sizes for the actor-critic module
-                * gamma (float): discount factor
-                * target_kl (float): target KL divergence
-                * batch_size (int): batch size for training
-                * learning_iters (int): number of iterations to train the model
-                * max_grad_norm (float): maximum gradient norm
-                * total_steps (int): total number of training steps
-                * steps_per_epoch (int): number of steps per epoch
-                * num_mini_batch (int): number of mini batches
-                * use_value_coefficient (bool): whether to use value coefficient
-                * use_critic_norm (bool): whether to use critic norm
-
-            * log_dir (str): directory to save the logs
-            * write_terminal (bool): whether to write the logs to terminal
-            * experiment (str): experiment name
-            * task (str): task name
-            * use_wandb (bool): whether to use wandb for logging
-
-
-    '''
-    config = args.config if args.config is not None else default_cfg if args.task not in isaac_gym_map.keys() else isaac_gym_specific_cfg
+def main(args, cfg_env=None):
+    # set the random seed, device and number of threads
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.set_num_threads(4)
     device = torch.device(f'{args.device}:{args.device_id}')
+
+    if args.task not in isaac_gym_map.keys():
+        env, obs_space, act_space = make_sa_mujoco_env(
+            num_envs=args.num_envs, env_id=args.task, seed=args.seed
+        )
+        eval_env, _, _ = make_sa_mujoco_env(num_envs=1, env_id=args.task, seed=None)
+        config = default_cfg
+
+    else:
+        sim_params = parse_sim_params(args, cfg_env, None)
+        env = make_sa_isaac_env(args=args, cfg=cfg_env, sim_params=sim_params)
+        eval_env = env
+        obs_space = env.observation_space
+        act_space = env.action_space
+        args.num_envs = env.num_envs
+        config = isaac_gym_specific_cfg
 
     # set training steps
     steps_per_epoch = config.get("steps_per_epoch", args.steps_per_epoch)
     total_steps = config.get("total_steps", args.total_steps)
     local_steps_per_epoch = steps_per_epoch // args.num_envs
     epochs = total_steps // steps_per_epoch
-
     # create the actor-critic module
-    obs_space = env.observation_space
-    if isinstance(obs_space, gym.spaces.Dict):
-        obs_space = gym.spaces.utils.flatten_space(obs_space)
-    act_space = env.action_space
-    if isinstance(act_space, gym.spaces.Dict):
-        act_space = gym.spaces.utils.flatten_space(act_space)
     policy = ActorVCritic(
         obs_dim=obs_space.shape[0],
         act_dim=act_space.shape[0],
         hidden_sizes=config["hidden_sizes"],
     ).to(device)
     reward_critic_optimizer = torch.optim.Adam(
-        policy.reward_critic.parameters(), lr=config["critic_lr"]
+        policy.reward_critic.parameters(), lr=1e-3
     )
     cost_critic_optimizer = torch.optim.Adam(
-        policy.cost_critic.parameters(), lr=config["critic_lr"]
+        policy.cost_critic.parameters(), lr=1e-3
     )
 
     # create the vectorized on-policy buffer
@@ -239,7 +216,6 @@ def train(env:object, args):
     logger = EpochLogger(
         log_dir=args.log_dir,
         seed=str(args.seed),
-        use_wandb=args.use_wandb,
     )
     rew_deque = deque(maxlen=50)
     cost_deque = deque(maxlen=50)
@@ -249,17 +225,15 @@ def train(env:object, args):
     eval_len_deque = deque(maxlen=50)
     logger.save_config(dict_args)
     logger.setup_torch_saver(policy.actor)
-
-    # reset environment
     logger.log("Start with training.")
     obs, _ = env.reset()
+    print('observation reset', obs.shape)
     obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
     ep_ret, ep_cost, ep_len = (
         np.zeros(args.num_envs),
         np.zeros(args.num_envs),
         np.zeros(args.num_envs),
     )
-
     # training loop
     for epoch in range(epochs):
         rollout_start_time = time.time()
@@ -268,11 +242,7 @@ def train(env:object, args):
             with torch.no_grad():
                 act, log_prob, value_r, value_c = policy.step(obs, deterministic=False)
             action = act.detach().squeeze() if args.task in isaac_gym_map.keys() else act.detach().squeeze().cpu().numpy()
-            try: 
-                next_obs, reward, cost, terminated, truncated, info = env.step(action)
-            except ValueError: 
-                next_obs, reward, terminated, truncated, info = env.step(action)
-                cost = info['cost']
+            next_obs, reward, cost, terminated, truncated, info = env.step(action)
 
             ep_ret += reward.cpu().numpy() if args.task in isaac_gym_map.keys() else reward
             ep_cost += cost.cpu().numpy() if args.task in isaac_gym_map.keys() else cost
@@ -293,7 +263,14 @@ def train(env:object, args):
                     dtype=torch.float32,
                     device=device,
                 )
-       
+            # print('Storing values')
+            # print('Observations shape:', obs.shape)
+            # print('Actions shape:', act.shape)
+            # print('Rewards shape:', reward.shape)
+            # print('Costs shape:', cost.shape)
+            # print('Value_r shape:', value_r.shape)
+            # print('Value_c shape:', value_c.shape)
+            # print('Log_prob shape:', log_prob.shape)
             buffer.store(
                 obs=obs,
                 act=act,
@@ -305,7 +282,6 @@ def train(env:object, args):
             )
 
             obs = next_obs
-            obs = torch.as_tensor(obs, dtype=torch.float32, device=device) # added
             epoch_end = steps >= local_steps_per_epoch - 1
             for idx, (done, time_out) in enumerate(zip(terminated, truncated)):
                 if epoch_end or done or time_out:
@@ -343,8 +319,6 @@ def train(env:object, args):
                     buffer.finish_path(
                         last_value_r=last_value_r, last_value_c=last_value_c, idx=idx
                     )
-                    obs, _ = env.reset()
-                    obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
         rollout_end_time = time.time()
 
         eval_start_time = time.time()
@@ -353,7 +327,7 @@ def train(env:object, args):
         if args.use_eval:
             for _ in range(eval_episodes):
                 eval_done = False
-                eval_obs, _ = env.reset()
+                eval_obs, _ = eval_env.reset()
                 eval_obs = torch.as_tensor(eval_obs, dtype=torch.float32, device=device)
                 eval_rew, eval_cost, eval_len = 0.0, 0.0, 0.0
                 while not eval_done:
@@ -562,7 +536,6 @@ def train(env:object, args):
                 "Misc/AcceptanceStep": acceptance_step,
                 "Loss/Loss_actor": (loss_pi_r + loss_pi_c).mean().item(),
                 "Train/KL": kl.cpu(),
-                "Misc/Optim_case": optim_case,
             },
         )
 
@@ -633,38 +606,54 @@ def train(env:object, args):
             logger.log_tabular("Misc/gradient_norm")
             logger.log_tabular("Misc/H_inv_g")
             logger.log_tabular("Misc/AcceptanceStep")
-            logger.log_tabular("Misc/Optim_case")
 
             logger.dump_tabular()
             if (epoch+1) % 100 == 0 or epoch == 0:
                 logger.torch_save(itr=epoch)
                 if args.task not in isaac_gym_map.keys():
-                    try: 
-                        logger.save_state(
-                            state_dict={"Normalizer": env.obs_rms,},
-                            itr = epoch
-                        )
-                    except: 
-                        logger.save_state(
-                            state_dict={"Env": env,},
-                            itr = epoch
-                        )
-
+                    logger.save_state(
+                        state_dict={
+                            "Normalizer": env.obs_rms,
+                        },
+                        itr = epoch
+                    )
     logger.close()
 
 
-def train_cpo(env:object, args):
-    # set the random seed, device and number of threads
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.backends.cudnn.deterministic = True
-    torch.set_num_threads(4)
-
-    if args.use_wandb: 
-        wandb.login()
-        with wandb.init(project=args.wandb_project, config=args.config):
-            train(env, args)
-    else: 
-        train(env, args)
-
+if __name__ == "__main__":
+    args, cfg_env = single_agent_args()
+    relpath = time.strftime("%Y-%m-%d-%H-%M-%S")
+    subfolder = "-".join(["seed", str(args.seed).zfill(3)])
+    relpath = "-".join([subfolder, relpath])
+    algo = os.path.basename(__file__).split(".")[0]
+    args.log_dir = os.path.join(args.log_dir, args.experiment, args.task, algo, relpath)
+    if not args.write_terminal:
+        terminal_log_name = "terminal.log"
+        error_log_name = "error.log"
+        terminal_log_name = f"seed{args.seed}_{terminal_log_name}"
+        error_log_name = f"seed{args.seed}_{error_log_name}"
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
+        if not os.path.exists(args.log_dir):
+            os.makedirs(args.log_dir, exist_ok=True)
+        with open(
+            os.path.join(
+                f"{args.log_dir}",
+                terminal_log_name,
+            ),
+            "w",
+            encoding="utf-8",
+        ) as f_out:
+            sys.stdout = f_out
+            with open(
+                os.path.join(
+                    f"{args.log_dir}",
+                    error_log_name,
+                ),
+                "w",
+                encoding="utf-8",
+            ) as f_error:
+                sys.stderr = f_error
+                main(args, cfg_env)
+    else:
+        main(args, cfg_env)

@@ -95,7 +95,7 @@ class FaultObserver(KalmanFilter):
             
         else: 
             self.update_a_posteriori(np.block(C_bar), output_noise_cov, y)
-            print('Updating only with measurement.')
+            # print('Updating only with measurement.')
         
         return self.estimate
 

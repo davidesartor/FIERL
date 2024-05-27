@@ -25,7 +25,7 @@ def flatten_and_extract_numbers(data):
     return np.array(numbers)
 
 
-def upper_trinagular(matrix): 
+def upper_triangular(matrix): 
     '''
     Return a flattened array of the upper triangular part of the matrix.
     '''

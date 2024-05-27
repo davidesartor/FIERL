@@ -170,7 +170,7 @@ def main(args, cfg_env=None):
         # FaultObserver(initial_state_estimate=system.state_dim, initial_fault_estimate=system.input_dim)
 
         ic_sampling_fnc = InitialConditionSampler(ic_type='ncube', half_side=1e-3, center = np.array([0.489, 0.2332, 0.3611]), n_samples=1)
-        fault_sampling_fnc = FaultSampler(fault_type='uniform', a=0, b=1, size=(system .input_dim,))
+        fault_sampling_fnc = FaultSampler(fault_type='uniform', a=0, b=1, size=(system.input_dim,))
 
         env = Environment(system = system, 
                         fault_observer = fault_observer, 
