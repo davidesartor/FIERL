@@ -32,16 +32,17 @@ from environment.utils import InitialConditionSampler, FaultSampler
 from safepo.single_agent.cpo import train_cpo
 
 training_config_default = {
-    'hidden_sizes': [128, 128, 128], 
+    'hidden_sizes': [512, 512, 512], 
     'gamma': 0.99, 
     'target_kl': 0.01, 
     'batch_size': 128, 
     'learning_iters': 10, 
     'max_grad_norm': 40, 
     'steps_per_epoch': 4000, 
-    'total_steps': 4000*500,
+    'total_steps': 4000*1000,
     'log_std_param': False, # if false the std is a layer, if true the std is a learnable parameter
-    'critic_lr':1e-3
+    'critic_lr':1e-3,
+    'cost_limit': 3.0, 
 }
 
 cfg_env_default = {
@@ -75,8 +76,9 @@ def main(args, cfg_env = None, training_config = None):
     cfg_env = cfg_env if cfg_env is not None else cfg_env_default
     training_config = training_config if training_config is not None else training_config_default
 
-    # add training config to args
+    # add training config and env_cfg to args
     args.config = training_config
+    args.env_cfg = cfg_env
 
     # define environment 
     system = ThreeTankSystem(min_input = cfg_env['min_action'], max_input = cfg_env['max_action'], state_noise_std = cfg_env['state_noise_std'], output_noise_std = cfg_env['output_noise_std'])
@@ -101,7 +103,7 @@ if __name__ == '__main__':
         {'name': '--use-eval', 'action':'store_true', 'help': 'Use evaluation environment for testing'},
         {'name': '--num-envs', 'type': int, 'default':1, 'help':'Number of environments to run in parallel'},
         {'name': '--task', 'type': str, 'default':'', 'help':'Task name'},
-        {'name': '--experiment', 'type': str, 'default': '3Tank', 'help':'Experiment name'},
+        {'name': '--experiment', 'type': str, 'default': 'ThreeTank', 'help':'Experiment name'},
         {'name': '--log-dir', 'type': str, 'default': 'runs', 'help':'Directory to save logs'},
         {'name': '--device', 'type': str, 'default': 'cpu', 'help':'Device to run on'},
         {'name': '--device-id', 'type': int, 'default': 0, 'help':'Device id to run on'},
@@ -114,7 +116,8 @@ if __name__ == '__main__':
         {'name': '--lagrangian-multiplier-init', 'type': float, 'default': 0.001, 'help': 'initial value of lagrangian multiplier'},
         {'name': '--lagrangian-multiplier-lr', 'type': float, 'default': 0.035, 'help': 'learning rate of lagrangian multiplier'},
         {'name': '--use-wandb', 'action': 'store_true', 'help': 'Toggles wandb logging'},
-        {'name': '--wandb-project', 'type': str, 'default': '3Tank', 'help': 'Wandb project name'},
+        {'name': '--wandb-project', 'type': str, 'default': 'FIERL-ThreeTank', 'help': 'Wandb project name'},
+        {'name': '--wandb-save', 'action': 'store_true', 'help': 'Toggles wandb saving'},
         ]
     
     parser = argparse.ArgumentParser(description='CPO for 3Tank')

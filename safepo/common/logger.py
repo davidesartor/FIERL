@@ -196,7 +196,7 @@ class Logger:
         self.log_current_row[key] = val
         
         if self.use_wandb: 
-            wandb.log({key: val})
+            wandb.log({key: val}, step=self.epoch)
 
     def save_config(self, config):
         """

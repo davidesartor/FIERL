@@ -413,7 +413,7 @@ def train(env:object, args):
         loss_pi_c.backward()
 
         b_grads = get_flat_gradients_from(policy.actor)
-        ep_costs = logger.get_stats("Metrics/EpCost") - args.cost_limit
+        ep_costs = logger.get_stats("Metrics/EpCost") - config.get("cost_limit", args.cost_limit)
 
         p = conjugate_gradients(fvp, policy, fvp_obs, b_grads, CONJUGATE_GRADIENT_ITERS)
         q = xHx
@@ -649,8 +649,18 @@ def train(env:object, args):
                             state_dict={"Env": env,},
                             itr = epoch
                         )
+                # save wandb checkpoint actorcritic in onnx format
+                if args.use_wandb and args.wandb_save:
+                    actor_onnx = policy.actor.to_onnx()
+                    wandb.save('actor_onnx.onnx')
+                    reward_critic_onnx = policy.reward_critic.to_onnx()
+                    wandb.save("reward_critic_onnx.onnx")
+                    cost_critic_onnx = policy.cost_critic.to_onnx()
+                    wandb.save("cost_critic_onnx.onnx")
+
 
     logger.close()
+
 
 
 def train_cpo(env:object, args):
