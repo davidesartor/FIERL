@@ -15,8 +15,8 @@ class LinearStateSystem:
         """
         self.dt = dt
 
-        self.min_input = min_input if min_input is not None else -np.inf
-        self.max_input = max_input if max_input is not None else np.inf
+        self.min_input = min_input if min_input is not None else [-np.inf]*B.shape[1]
+        self.max_input = max_input if max_input is not None else [np.inf]*B.shape[1]
 
         if sys_type == 'continuous':
             self.system = lti(A, B, C, D).to_discrete(self.dt)
@@ -30,6 +30,8 @@ class LinearStateSystem:
         Args:
             x0 (np.ndarray): array of shape (n,1) representing the initial state
         """
+        if isinstance(x0, int): 
+            x0 = x0 * np.ones((self.state_dim, 1))
         self.state = x0
 
     @property
@@ -70,7 +72,7 @@ class LinearStateSystem:
         Args: 
             input (np.ndarray): array of shape (m,1) representing the input vector
         """
-        input = np.clip(input, self.min_input, self.max_input)
+        # input = np.clip(input, self.min_input, self.max_input)
         self.state = self.A @ self.state + self.B @ input
 
 
@@ -115,10 +117,10 @@ class FaultyActuatorNoisySystem(LinearStateSystem):
             input (np.ndarray): array of shape (m,1) representing the input vector
             state_noise (np.ndarray): array of shape (n,1) representing the state noise. If None, the state noise is sampled from a normal distribution with standard deviation self.state_noise_std
         """
-        input = np.clip(input, self.min_input, self.max_input)
+        # input = np.clip(input, self.min_input, self.max_input)
         self.state = self.A @ self.state + self.B @  self.G @ input
         if state_noise is None: 
-            self.state += np.random.normal(0, self.state_noise_std, size=(self.state_dim, 1))
+            self.state += np.random.normal(0, self.state_noise_std, size=(self.state_dim, 1)) 
         else: 
             self.state += state_noise
         

@@ -29,8 +29,10 @@ class ObserverLogger:
     def log(self, system, observer = None, control_input = None, reference = None): 
 
         # log time 
-        try: self.time_log.append(self.time_log[-1] + system.dt)
-        except: self.time_log.append(0)
+        if self.time_log: # if not empty 
+            self.time_log.append(self.time_log[-1] + system.dt)
+        else: 
+            self.time_log.append(0)
 
         # log system state, fault, output and control input if available
         self.state_log.append(system.state)
@@ -65,7 +67,7 @@ class ObserverLogger:
         
         for i,(x,lab,c) in enumerate(zip(x, labels, colors)):
             if step_visual: 
-                plt.step(times, x, '-', markersize = 3, linewidth = 1, alpha=1, color=c, label=lab)
+                plt.step(times, x, '-', markersize = 3, linewidth = 1, alpha=1, color=c, label=lab) #, where='mid')
             else:
                 plt.plot(times, x, 'o-', markersize = 3, linewidth = 2, alpha=0.5, color=c, label=lab)
         plt.legend(loc='lower right')

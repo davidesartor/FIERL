@@ -71,21 +71,15 @@ class Actor(nn.Module):
         action_distribution = actor(observation)
     """
 
-    def __init__(self, obs_dim: int, act_dim: int, hidden_sizes: list = [64, 64], action_offset=0.0): #scale_factor: float = 0.0):
+    def __init__(self, obs_dim: int, act_dim: int, hidden_sizes: list = [64, 64]):
         super().__init__()
-        # self.scale_factor = nn.Parameter(torch.tensor(scale_factor, dtype=torch.float32), requires_grad=True)
-        # self.scale_factor = torch.tensor(scale_factor, dtype=torch.float32)
-        self.action_offset = action_offset
-        self.log_scale_factor = nn.Parameter(torch.tensor(-10, dtype=torch.float32), requires_grad=True)
         self.mean = build_mlp_network([obs_dim]+hidden_sizes+[act_dim])
-        self.log_std = nn.Parameter(torch.zeros(act_dim), requires_grad=True)
+        self.log_std = nn.Parameter(torch.zeros(act_dim), requires_grad=True) 
 
     def forward(self, obs: torch.Tensor):
         mean = self.mean(obs)
         std = torch.exp(self.log_std)
-        # return Normal(mean, self.scale_factor * std)
-        scale = torch.exp(self.log_scale_factor)
-        return Normal(mean * scale + self.action_offset, std * (scale))
+        return Normal(mean, std)
 
 class Actor2(nn.Module):
     """
@@ -99,7 +93,7 @@ class Actor2(nn.Module):
 
     Attributes:
         mean (nn.Sequential): MLP network representing the mean of the action distribution.
-        log_std (nn.Parameter): MLP network representing the logstd of the action distribution.
+        log_std (nn.Parameter): Learnable parameter representing the log standard deviation of the action distribution.
 
     Example:
         obs_dim = 10
@@ -109,11 +103,8 @@ class Actor2(nn.Module):
         action_distribution = actor(observation)
     """
 
-    def __init__(self, obs_dim: int, act_dim: int, hidden_sizes: list = [64, 64], action_offset = 0.0): # scale_factor: float = 1.0):
+    def __init__(self, obs_dim: int, act_dim: int, hidden_sizes: list = [64, 64]):
         super().__init__()
-        # self.scale_factor = torch.tensor(scale_factor, dtype=torch.float32)
-        self.log_scale_factor = nn.Parameter(torch.tensor(-10, dtype=torch.float32), requires_grad=True)
-        self.action_offset = action_offset
         self.net = build_mlp_network([obs_dim]+hidden_sizes)
         self.mean = nn.Linear(hidden_sizes[-1], act_dim)
         self.log_std = nn.Linear(hidden_sizes[-1], act_dim)
@@ -122,8 +113,7 @@ class Actor2(nn.Module):
         net_out = self.net(obs)
         mean = self.mean(net_out)
         std = torch.exp(self.log_std(net_out))
-        scale = torch.exp(self.log_scale_factor)
-        return Normal(mean * scale + self.action_offset, std * scale) 
+        return Normal(mean, std)
 
 class VCritic(nn.Module):
     """
@@ -172,14 +162,14 @@ class ActorVCritic(nn.Module):
         value_estimate = actor_critic.get_value(observation)
     """
 
-    def __init__(self, obs_dim, act_dim, hidden_sizes: list = [64, 64], log_std_params: bool = True, action_offset: float = 0.0): #scale_factor_std: float = 0.0):
+    def __init__(self, obs_dim, act_dim, hidden_sizes: list = [64, 64], log_std_params: bool = True):
         super().__init__()
         self.reward_critic = VCritic(obs_dim, hidden_sizes)
         self.cost_critic = VCritic(obs_dim, hidden_sizes)
         if log_std_params: 
-            self.actor = Actor(obs_dim, act_dim, hidden_sizes, action_offset) # scale_factor_std)
+            self.actor = Actor(obs_dim, act_dim, hidden_sizes)
         else: 
-            self.actor = Actor2(obs_dim, act_dim, hidden_sizes, action_offset) #scale_factor_std)
+            self.actor = Actor2(obs_dim, act_dim, hidden_sizes)
 
     def get_value(self, obs):
         """

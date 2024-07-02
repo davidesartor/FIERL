@@ -1,5 +1,6 @@
 from typing import Any
 import numpy as np
+import random
 
 def flatten_and_extract_numbers(data):
     '''
@@ -119,10 +120,17 @@ def sampling_uniformly_from_n_cube(half_side:float, center:np.ndarray, n_samples
     return np.random.rand(n_samples, d) * 2 * half_side - half_side + center
 
 
-def sampling_uniformly_fault(a, b, size): 
-    return np.random.uniform(a, b, size = size) # controllare in caso, si usava random.uniform sulla versione di TF1. 
+# def sampling_uniformly_fault(a, b, size): 
+#     return np.random.uniform(a, b, size = size) # controllare in caso, si usava random.uniform sulla versione di TF1. 
 
-
+def sampling_uniformly_fault(a, b, size):    
+    def generate_list(dimensions, depth=0):
+        if depth == len(dimensions) - 1:
+            return [random.uniform(a, b) for _ in range(dimensions[depth])]
+        else:
+            return [generate_list(dimensions, depth + 1) for _ in range(dimensions[depth])]
+    
+    return np.array(generate_list(size))
 
 class InitialConditionSampler:
     '''

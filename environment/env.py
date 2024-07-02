@@ -5,6 +5,7 @@ from gymnasium import spaces
 import inspect
 from environment.utils import * 
 import inspect
+from environment.faultobserver.faultobserver import GaussianEstimate
 
 
 class Environment(gym.Env): 
@@ -83,8 +84,15 @@ class Environment(gym.Env):
         initial_fault = self.fault_generator_fnc() if initial_fault is None else initial_fault
         self.system.set_fault(initial_fault)
 
-        self.fault_observer.reset()
-        self.fault_observer.update(y = self.system.output, C = self.system.C, output_noise_cov = np.eye(self.system.output_dim) * self.system.output_noise_std**2,)
+        ## CHANGE to start with a better estimate
+        ise = GaussianEstimate(initial_state.reshape(-1, 1), cov = 0.1 * np.eye(self.system.state_dim))
+        ife = GaussianEstimate(initial_fault.reshape((-1, 1)), cov = 0.1 * np.eye(self.system.input_dim))
+   
+        self.fault_observer.reset(initial_state_estimate = ise, initial_fault_estimate = ife)
+        # ===================================================================
+
+        # self.fault_observer.reset()
+        # self.fault_observer.update(y = self.system.output, C = self.system.C, output_noise_cov = np.eye(self.system.output_dim) * self.system.output_noise_std**2,)
 
         if self.observer_logger is not None: 
             self.observer_logger.reset()
@@ -124,7 +132,7 @@ class Environment(gym.Env):
             truncated = np.expand_dims(True, axis=0)
             return observation, reward, terminated, truncated, info
         return observation, reward, terminated, truncated, info
-        
+
     def _get_info(self): 
         return {'cost': self._get_cost(), 
                 'step_counter': self.step_counter,

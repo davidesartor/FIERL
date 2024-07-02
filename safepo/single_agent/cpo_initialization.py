@@ -37,8 +37,9 @@ from torch.utils.data import DataLoader, TensorDataset
 from safepo.common.buffer import VectorizedOnPolicyBuffer
 # from safepo.common.env import make_sa_mujoco_env, make_sa_isaac_env
 from safepo.common.logger import EpochLogger
-from safepo.common.model_original import ActorVCritic
+from safepo.common.model import ActorVCritic
 from safepo.utils.config import single_agent_args, isaac_gym_map, parse_sim_params
+from environment.faultobserver.observerlogger import ObserverLogger
 
 import gymnasium as gym 
 import wandb
@@ -56,6 +57,7 @@ default_cfg = {
     'learning_iters': 10,
     'max_grad_norm': 40.0,
     'critic_lr': 1e-3,
+    'itr_policy_init': 10,
 }
 
 isaac_gym_specific_cfg = {
@@ -186,13 +188,12 @@ def train(env:object, args):
                 * num_mini_batch (int): number of mini batches
                 * use_value_coefficient (bool): whether to use value coefficient
                 * use_critic_norm (bool): whether to use critic norm
-
+                * action_offset (float, optional): initial offset of the action for the policy initialization
             * log_dir (str): directory to save the logs
             * write_terminal (bool): whether to write the logs to terminal
             * experiment (str): experiment name
             * task (str): task name
             * use_wandb (bool): whether to use wandb for logging
-
 
     '''
     config = args.config if args.config is not None else default_cfg if args.task not in isaac_gym_map.keys() else isaac_gym_specific_cfg
@@ -211,11 +212,16 @@ def train(env:object, args):
     act_space = env.action_space
     if isinstance(act_space, gym.spaces.Dict):
         act_space = gym.spaces.utils.flatten_space(act_space)
+
+
+    action_offset = config.get("action_offset", 0)
     policy = ActorVCritic(
-        obs_dim=obs_space.shape[0],
-        act_dim=act_space.shape[0],
-        hidden_sizes=config["hidden_sizes"],
+        obs_dim = obs_space.shape[0],
+        act_dim = act_space.shape[0],
+        hidden_sizes=config['hidden_sizes'],
+        action_offset = action_offset,
     ).to(device)
+
     reward_critic_optimizer = torch.optim.Adam(
         policy.reward_critic.parameters(), lr=config["critic_lr"]
     )
@@ -250,6 +256,11 @@ def train(env:object, args):
     logger.save_config(dict_args)
     logger.setup_torch_saver(policy.actor)
 
+
+    # add observerlogger to env
+    env.observer_logger = ObserverLogger()
+  
+
     # reset environment
     logger.log("Start with training.")
     obs, _ = env.reset()
@@ -260,24 +271,21 @@ def train(env:object, args):
         np.zeros(args.num_envs),
     )
 
+
     # training loop
     for epoch in range(epochs):
         rollout_start_time = time.time()
         # collect samples until we have enough to update
+        episode = 0
         for steps in range(local_steps_per_epoch):
             with torch.no_grad():
                 act, log_prob, value_r, value_c = policy.step(obs, deterministic=False)
             action = act.detach().squeeze() if args.task in isaac_gym_map.keys() else act.detach().squeeze().cpu().numpy()
-            # try: # error, it performs a step in the environment and if exception it performs another one. # find alternative solution
-            #     print('env step1', env.step_counter)
+            # try: 
             #     next_obs, reward, cost, terminated, truncated, info = env.step(action)
-            #     print('env step2', env.step_counter)
             # except ValueError: 
-    
             #     next_obs, reward, terminated, truncated, info = env.step(action)
             #     cost = info['cost']
-            #     print('env step4', env.step_counter)
-            # print('env step5', env.step_counter)
             next_obs, reward, terminated, truncated, info = env.step(action)
             cost = info['cost']
 
@@ -289,6 +297,7 @@ def train(env:object, args):
                 for x in (next_obs, reward, cost, terminated, truncated)
             )
             if "final_observation" in info:
+                episode += 1
                 info["final_observation"] = np.array(
                     [
                         array if array is not None else np.zeros(obs.shape[-1])
@@ -300,7 +309,13 @@ def train(env:object, args):
                     dtype=torch.float32,
                     device=device,
                 )
-       
+
+                # plot the evolution
+                if epoch % 10 == 0 and episode == 1: 
+                    env.render(save=True, save_path = "/root/FIERL/"+str(epoch))
+                # assert False
+
+            
             buffer.store(
                 obs=obs,
                 act=act,

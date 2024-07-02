@@ -8,6 +8,10 @@ import numpy as np
 import joblib
 import torch
 import gymnasium
+import seaborn as sns
+import sys
+import pandas as pd
+sys.path.append('/root/FIERL/')
 
 from environment.env import Environment
 from environment.systems.threetank import ThreeTankSystem
@@ -90,6 +94,31 @@ def runs_eval(args):
 
         if args.render: 
             eval_env.render(save=True, save_path = eval_dir)
+
+            # # plot the last estimate 
+            # state_est, fault_est = eval_env.fault_observer.split()
+
+            # estimate = eval_env.fault_observer.estimate
+            # dist = np.random.multivariate_normal(estimate.mean.squeeze(), estimate.cov, size=1000)
+            # dist = pd.DataFrame(dist)
+            # pairplot = sns.pairplot(dist)
+            # pairplot.savefig(eval_dir + '/estimate_last.png')
+
+
+            # mean_state = state_est.mean.squeeze()
+
+
+            # dist = np.random.multivariate_normal(state_est.mean.squeeze(), state_est.cov, size=1000)
+            # dist = pd.DataFrame(dist)
+            # pairplot = sns.pairplot(dist)
+            # pairplot.savefig(eval_dir + '/state_est_last.png')
+
+
+            # dist = np.random.multivariate_normal(fault_est.mean.squeeze(), fault_est.cov, size = 1000)
+            # dist = pd.DataFrame(dist)
+            # pairplot = sns.pairplot(dist)
+            # pairplot.savefig(eval_dir + '/fault_est_last.png')
+
 
     rew_sum_mean = sum(reward_sum_list) / len(reward_sum_list)
     rew_sum_std = np.std(reward_sum_list)
