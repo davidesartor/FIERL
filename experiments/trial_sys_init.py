@@ -19,7 +19,7 @@ import wandb
 from environment.env import Environment
 from environment.systems.trial_system import ProvaSystem
 from environment.faultobserver.faultobserver import FaultObserver, GaussianEstimate
-from environment.utils import InitialConditionSampler, FaultSampler, SpecialFaultSampler
+from environment.utils import InitialConditionSampler, FaultSampler
 
 
 from safepo.single_agent.cpo_initialization import train_cpo 
