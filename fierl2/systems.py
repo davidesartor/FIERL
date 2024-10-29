@@ -1,4 +1,3 @@
-from typing import ClassVar
 import jax
 import jax.numpy as jnp
 import jax.random as jr
@@ -6,16 +5,16 @@ import equinox as eqx
 
 
 class DSSM(eqx.Module):
-    dt: float = 1.0
-    x_dim: ClassVar[int]
-    u_dim: ClassVar[int]
-    y_dim: ClassVar[int]
+    x_dim: eqx.AbstractVar[int]
+    u_dim: eqx.AbstractVar[int]
+    y_dim: eqx.AbstractVar[int]
+    dt: eqx.AbstractVar[float]
 
     def step(self, x, u, *, key=None) -> tuple[jax.Array, jax.Array]:
         raise NotImplementedError
 
     def reset_state(self, *, key=None):
-        return jnp.zeros(self.x_dim)
+        raise NotImplementedError
 
     def trajectory(self, x0, ut, *, key=None):
         def scan_fn(x, input):
@@ -48,28 +47,62 @@ class DSSM(eqx.Module):
         return A, B, C, D, dx, dy
 
 
-class ToyExample(DSSM):
-    flow_u_to_1: float = 1.0
-    flow_1_to_2: float = 0.1
-    flow_2_to_y: float = 0.1
+class FaultyDSSM(DSSM):
+    z_dim: eqx.AbstractVar[int]
+
+    def __post_init__(self):
+        self.x_dim += self.z_dim
+
+    def split_state(self, x) -> tuple[jax.Array, jax.Array]:
+        x, z = jnp.split(x, (self.x_dim - self.z_dim,), axis=-1)
+        return x, z
+
+
+class ToyExample(FaultyDSSM):
+    x_dim: int = 2
+    u_dim: int = 2
+    y_dim: int = 1
+    z_dim: int = eqx.field(init=False)
+
+    flow_coef: float = 0.5
+    input_coef: float = 1.0
+    output_coef: float = 1.0
+
     x_noise_std: float = 1e-1
     y_noise_std: float = 1e-1
+    dt: float = 1.0
 
-    x_dim: ClassVar[int] = 2
-    u_dim: ClassVar[int] = 1
-    y_dim: ClassVar[int] = 1
+    def __post_init__(self):
+        self.z_dim = self.u_dim
+        super().__post_init__()
+
+    def reset_state(self, *, key=None):
+        x = jnp.zeros(self.x_dim - self.z_dim)
+        z = jnp.ones(self.z_dim)
+        if key is not None:
+            key_idx, key_val = jr.split(key)
+            z = z.at[jr.choice(key_idx, self.z_dim)].set(jr.uniform(key_val))
+        return jnp.concatenate([x, z], axis=-1)
 
     def step(self, x, u, *, key=None):
-        x1, x2 = jnp.split(x, 2, axis=-1)
-        y = 0.0 + self.flow_2_to_y * x2 - 0.0
-        x2 = x2 + self.flow_1_to_2 * x1 - self.flow_2_to_y * x2
-        x1 = x1 + self.flow_u_to_1 * u - self.flow_1_to_2 * x1
-        x = jnp.concatenate([x1, x2], axis=-1)
+        x, z = self.split_state(x)
+        inflow = self.input_coef * (u * z).sum()
+        mixflows = self.flow_coef * x[:-1]
+        outflow = self.output_coef * x[-1]
+
+        x = x.at[0].add(inflow)
+        x = x.at[:-1].add(-mixflows)
+        x = x.at[1:].add(mixflows)
+        x = x.at[-1].add(-outflow)
+
+        y = outflow * jnp.ones(self.y_dim)
 
         if key is not None:
             kx, ky = jr.split(key)
             x = x + jr.normal(kx, x.shape) * self.x_noise_std
             y = y + jr.normal(ky, y.shape) * self.y_noise_std
+
+        x = jnp.concat([x, z], axis=-1)
         return x, y
 
 
@@ -78,9 +111,11 @@ class Car(DSSM):
     steer: float = 1.0
     integration_steps: int = 10
 
-    x_dim: ClassVar[int] = 4
-    u_dim: ClassVar[int] = 2
-    y_dim: ClassVar[int] = 2
+    x_dim = 4
+    u_dim = 2
+    y_dim = 2
+
+    dt = 1.0
 
     def step(self, x, u, *, key=None):
         def dx(x, u):
@@ -116,9 +151,11 @@ class RoboArm(DSSM):
 
     integration_steps: int = 10
 
-    x_dim: ClassVar[int] = 4
-    u_dim: ClassVar[int] = 1
-    y_dim: ClassVar[int] = 2
+    x_dim = 4
+    u_dim = 1
+    y_dim = 2
+
+    dt = 1.0
 
     def step(self, x, u, *, key=None):
         def dx(x, u):
@@ -151,9 +188,11 @@ class PointSatellite(DSSM):
     theta2: float = 1.0
     integration_steps: int = 10
 
-    x_dim: ClassVar[int] = 4
-    u_dim: ClassVar[int] = 2
-    y_dim: ClassVar[int] = 3
+    x_dim = 4
+    u_dim = 2
+    y_dim = 3
+
+    dt = 1.0
 
     def init_state(self, *, key=None):
         r, phi = 10.0, 0.0
