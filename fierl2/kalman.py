@@ -1,45 +1,44 @@
 from jaxtyping import Float, Array
 import jax
 import jax.numpy as jnp
-import equinox as eqx
-from systems import DSSM, UNINITIALIZED
+import flax.linen as nn
+from systems import DSSM
 
 
-class KalmanFilter(eqx.Module):
-    x: Float[Array, "x"] = eqx.field(init=False, default_factory=UNINITIALIZED)
-    P: Float[Array, "x x"] = eqx.field(init=False, default_factory=UNINITIALIZED)
+class KalmanFilter(nn.Module):
+    sys: DSSM
+    Q: Float[Array, "x x"]
+    R: Float[Array, "y y"]
 
-    sys: DSSM = eqx.field(static=True)
-    Q: Float[Array, "x x"] = eqx.field(static=True)
-    R: Float[Array, "y y"] = eqx.field(static=True)
+    def setup(self):
+        self.variable("state", "x", self.sys.x0)
+        self.variable("state", "P", lambda: jnp.eye(self.sys.x_dim))
 
-    def replace(self, *, x, P):
-        return eqx.tree_at(lambda s: (s.x, s.P), self, (x, P))
+    def __call__(self):
+        return self.get_variable("state", "x")
 
-    def reset(self, *, rng=None):
-        x = self.sys.reset(rng=rng).x
-        P = jnp.eye(x.shape[-1])
-        return self.replace(x=x, P=P)
+    def step(self, u: Float[Array, "u"], y: Float[Array, "y"]):
+        x = self.get_variable("state", "x")
+        P = self.get_variable("state", "P")
 
-    def update(self, u: Float[Array, "u"], y: Float[Array, "y"]):
-        A, C, dx, dy = self.linearized_step(self.x, u)
+        A, C, dx, dy = self.linearized_step(x, u)
 
         # a priori update
-        self = self.replace(
-            x=A @ self.x + dx,
-            P=A @ self.P @ A.T + self.Q,
-        )
+        x = A @ x + dx
+        P = A @ P @ A.T + self.Q
 
         # a posteriori update
-        K = self.P @ C.T @ jnp.linalg.inv(C @ self.P @ C.T + self.R)
-        return self.replace(
-            x=self.x + K @ (y - C @ self.x - dy),
-            P=self.P - K @ C @ self.P,
-        )
+        K = P @ C.T @ jnp.linalg.inv(C @ P @ C.T + self.R)
+        x = x + K @ (y - C @ x - dy)
+        P = P - K @ C @ P
 
+        self.put_variable("state", "x", x)
+        self.put_variable("state", "P", P)
+
+    @nn.nowrap
     def linearized_step(self, x: Float[Array, "x"], u: Float[Array, "u"]):
-        A, C = jax.jacobian(lambda x: self.sys.step(x, u))(x)
-        dx, dy = self.sys.step(x, u)
+        A, C = jax.jacobian(lambda x: self.sys(x, u))(x)
+        dx, dy = self.sys(x, u)
         dx = dx - A @ x
         dy = dy - C @ x
         return A, C, dx, dy

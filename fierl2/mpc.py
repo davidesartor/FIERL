@@ -1,12 +1,12 @@
-from typing import Self
+from typing import Self, NamedTuple
 from jaxtyping import Float, Array
 import jax
 import jax.numpy as jnp
-import equinox as eqx
-from systems import DSSM, UNINITIALIZED
+import flax.linen as nn
+from systems import DSSM
 
 
-class Costs(eqx.Module):
+class Costs(NamedTuple):
     y: Float[Array, "y y"]
     u: Float[Array, "u u"]
     x: Float[Array, "x x"]
@@ -18,50 +18,45 @@ class Costs(eqx.Module):
         return jax.tree_map(cal, self)
 
 
-class References(eqx.Module):
+class References(NamedTuple):
     y: Float[Array, "t y"]
     u: Float[Array, "t u"]
     x: Float[Array, "t x"]
 
-    def slice(self, t: int, horizon: int):
+    def slice(self, t: int, horizon: int) -> Self:
         return jax.tree_map(
             lambda x: jax.lax.dynamic_slice(x, (t, 0), (horizon, x.shape[-1])), self
         )
 
 
-class MPC(eqx.Module):
-    step: int = eqx.field(init=False, default_factory=UNINITIALIZED)
-    u: Float[Array, "u"] = eqx.field(init=False, default_factory=UNINITIALIZED)
-    ut: Float[Array, "n u"] = eqx.field(init=False, default_factory=UNINITIALIZED)
+class MPC(nn.Module):
+    sys: DSSM
+    horizon: int
+    discount: float
+    ref: References
+    J: Costs
 
-    sys: DSSM = eqx.field(static=True)
-    horizon: int = eqx.field(static=True)
-    discount: float = eqx.field(static=True)
-    ref: References = eqx.field(static=True)
-    J: Costs = eqx.field(static=True)
-    J_cal: Costs = eqx.field(static=True, init=False)
+    @property
+    def J_cal(self):
+        return self.J.calligraphic(self.horizon, self.discount)
 
-    def __post_init__(self):
-        self.J_cal = self.J.calligraphic(self.horizon, self.discount)
+    def setup(self):
+        self.variable("state", "t", lambda: 0)
+        self.variable("state", "ut", lambda: self.ref.slice(0, self.horizon).u)
 
-    def replace(self, *, step, u, ut):
-        return eqx.tree_at(lambda s: (s.step, s.u, s.ut), self, (step, u, ut))
+    def __call__(self):
+        return self.get_variable("state", "ut")[0]
 
-    def reset(self, *, rng=None):
-        ut = jnp.roll(self.ref.u[: self.horizon, :], 1, axis=-2)
-        return self.replace(step=0, u=ut[0], ut=ut)
+    def step(self, x: Float[Array, "x"]):
+        t = self.get_variable("state", "t")
+        ut = self.get_variable("state", "ut")
 
-    def update(self, x: Float[Array, "x"]):
-        ref = self.ref.slice(self.step, self.horizon)
-        ut = jnp.roll(self.ut, -1, axis=-2).at[-1, :].set(ref.u[-1, :])
-        ut = self.optimal_control_sequence(ut, x, ref)
-        return self.replace(step=self.step + 1, u=ut[0], ut=ut)
+        ref = self.ref.slice(t, self.horizon)
+        ut = jnp.roll(ut, -1, axis=-2).at[-1].set(ut[-1])
 
-    def optimal_control_sequence(
-        self, ut: Float[Array, "t u"], x: Float[Array, "x"], ref: References
-    ):
+        # find optimal control
         B, D, dx, dy = self.linearized_trajectory(ut, x)
-        return jnp.linalg.solve(
+        ut = jnp.linalg.solve(
             a=D.T @ self.J_cal.y @ D + self.J_cal.u + B.T @ self.J_cal.x @ B,
             b=(
                 D.T @ self.J_cal.y @ (ref.y.flatten() - dy)
@@ -70,9 +65,13 @@ class MPC(eqx.Module):
             ),
         ).reshape(ut.shape)
 
+        self.put_variable("state", "t", t + 1)
+        self.put_variable("state", "ut", ut)
+
+    @nn.nowrap
     def linearized_trajectory(self, ut: Float[Array, "t u"], x: Float[Array, "x"]):
         def scan_compatible_step(x, u):
-            x, y = self.sys.step(x, u)
+            x, y = self.sys(x, u)
             return x, (x, y)
 
         trajectory = lambda ut: jax.lax.scan(scan_compatible_step, x, ut)[1]
