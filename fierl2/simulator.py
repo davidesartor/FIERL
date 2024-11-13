@@ -1,131 +1,151 @@
-from dataclasses import InitVar
-from typing import NamedTuple
+from functools import partial
+from typing import NamedTuple, Self
+from jaxtyping import Array, Float, Key
 import jax
 import jax.numpy as jnp
 import jax.random as jr
 import equinox as eqx
-from jax import Array
-from systems import DSSM, FaultyDSSM
-from mpc import MPC
-from kalman import KalmanFilter, Gaussian
-
-KeyArray = Array
-SqrMatrix = Array
 
 
-class SimState(NamedTuple):
-    x: Array
-    est: Gaussian
-    ut: Array
+from utils import Module, RESET
+from systems import FDSSM
+from observers import KalmanFilter
+from controllers import MPC
+from ppo import PPO, Policy
 
 
-class SimStep(NamedTuple):
-    x: Array
-    est: Gaussian
-    ut: Array
-    u: Array
-    y: Array
+class StepOut(NamedTuple):
+    u: Float[Array, "t u"]
+    a: Float[Array, "t u"]
+    log_p: Float[Array, "t"]
+    y: Float[Array, "t y"]
 
 
-class Simulator(eqx.Module):
-    system: FaultyDSSM = eqx.field(static=True)
-    mpc_horizon: int = eqx.field(static=True)
-    Jy: SqrMatrix = eqx.field(static=True, default=1.0)
-    Ju: SqrMatrix = eqx.field(static=True, default=1e-8)
-    Jx: SqrMatrix = eqx.field(static=True, default=0.0)
-    Je: SqrMatrix = eqx.field(static=True, default=1.0)
-    Q: SqrMatrix = eqx.field(static=True, default=1.0)
-    R: SqrMatrix = eqx.field(static=True, default=1.0)
+class Simulator(Module):
+    t: int = eqx.field(init=False, default_factory=RESET)
+    sys: FDSSM
+    mpc: MPC
+    kf: KalmanFilter
+    # policy: PPO
 
-    mpc: MPC = eqx.field(init=False, static=True)
-    observer: KalmanFilter = eqx.field(init=False, static=True)
+    Jy: Float[Array, "y y"] = eqx.field(static=True)
+    Ju: Float[Array, "u u"] = eqx.field(static=True)
+    Je: Float[Array, "z+x z+x"] = eqx.field(static=True)
+    ref_y: Float[Array, "t y"] = eqx.field(static=True)
+    ref_u: Float[Array, "t u"] = eqx.field(static=True)
 
-    def __post_init__(self):
-        self.Jy = self.Jy * jnp.eye(self.system.y_dim)
-        self.Ju = self.Ju * jnp.eye(self.system.u_dim)
-        self.Jx = self.Jx * jnp.eye(self.system.x_dim)
-        self.Je = self.Je * jnp.eye(self.system.x_dim)
-        self.mpc = MPC(
-            self.system.step, self.mpc_horizon, Jy=self.Jy, Ju=self.Ju, Jx=self.Jx
+    discount: float = 0.9
+    t_fault: float = 0.2
+
+    def reset(self, *, rng: Key | None):
+        rng_1, rng_2, rng_3 = (None,) * 3 if rng is None else jr.split(rng, 3)
+        return self.replace(
+            t=0,
+            sys=self.sys.reset(rng=rng_1),
+            kf=self.kf.reset(rng=rng_2),
+            mpc=self.mpc.reset(rng=rng_3),
         )
-        self.Q = self.Q * jnp.diag(jnp.ones(self.system.x_dim))
-        self.R = self.R * jnp.eye(self.system.y_dim)
-        self.observer = KalmanFilter(self.system.step, self.Q, self.R)
 
-    def get_reward(self, step, y_ref, u_ref, x_ref):
-        norm = lambda x, J: x.T @ J @ x
-        cost_y = norm(step.y - y_ref, Jy)
-        cost_u = norm(step.u + step.a - u_ref, Ju)
-        cost_x = norm(step.x - x_ref, Jx)
-        cost_e = norm(step.est.mean - step.x, Je)
-        cost_e_std = jnp.trace(Je @ step.est.cov, axis1=-1, axis2=-2)
-        reward = -(cost_y + cost_u + cost_x + cost_e + cost_e_std)
-        return reward
+    def step(self, *, rng: Key, use_aux=True) -> tuple[Self, StepOut]:
+        rng_step, rng_act = jr.split(rng)
+
+        # get the control
+        ref_y = jax.lax.dynamic_slice_in_dim(self.ref_y, self.t, self.mpc.horizon)
+        ref_u = jax.lax.dynamic_slice_in_dim(self.ref_u, self.t, self.mpc.horizon)
+        mpc = self.mpc.update(x=self.kf(), ref_y=ref_y, ref_u=ref_u)
+        u = mpc()
+
+        # a, log_p = self.policy(state.kf)(rng=rng_act)
+        # if not policy:
+        #     a = jnp.zeros_like(a)
+        a = jnp.zeros_like(u)
+        log_p = jnp.zeros(())
+
+        # step the system and update the observer
+        sys, y = self.sys.step(u=u + a, rng=rng_step)
+        kf = self.kf.update(u=u + a, y=y)
+        self = self.replace(t=self.t + 1, sys=sys, kf=kf, mpc=mpc)
+
+        return self, StepOut(u=u, a=a, log_p=log_p, y=y)
+
+    def rewards(self, steps: StepOut):
+        norm = lambda x, J: jnp.einsum("ti, ij, tj -> t", x, J, x)
+        cost_y = norm(steps.y - self.ref_y, self.Jy)
+        cost_u = norm(steps.u + steps.a - self.ref_u, self.Ju)
+
+        x_aug = jnp.concat([steps.state.z, steps.state.x], axis=-1)
+        cost_e = norm(steps.state.kf.x - x_aug, self.Je)
+        cost_e_std = jnp.trace(steps.state.kf.P @ self.Je, axis1=-1, axis2=-2)
+        return -(cost_y + cost_u + cost_e + cost_e_std)
 
     @eqx.filter_jit
-    def rollout(
-        self,
-        y_ref: Array,
-        u_ref: Array,
-        x_ref: Array,
-        *,
-        key: KeyArray,
-        t_fault: int | float = 0.1,
-        use_policy: bool = True,
-        det_policy: bool = False,
-    ):
-        def prepare_inputs(key, y_ref, u_ref, x_ref):
-            assert len(y_ref) == len(u_ref) == len(x_ref)
-            keys_steps = jr.split(key, len(y_ref))
-            inputs = (keys_steps, *map(self.mpc.windows, (y_ref, u_ref, x_ref)))
-            return inputs
+    def rollout(self, *, rng: Key, use_aux=True):
+        def scan_fn(state, rng, use_aux):
+            state, steps = state.step(rng=rng, use_aux=use_aux)
+            return state, (state, steps)
 
-        def init_sim_state(key):
-            key_x0, key_est0, key_ut0 = jr.split(key, 3)
-            x0_nominal = self.system.reset_state()
-            x = x0_nominal  # self.system.reset_state(key=key_x0)
-            est = self.observer.reset_est(mean=x0_nominal, key=key_est0)
-            ut = self.mpc.reset_ut(key=key_ut0)
-            return x, est, ut
+        rng_init, rng_fault, rng_steps1, rng_steps2 = jr.split(rng, 4)
+        sim = self.reset(rng=rng_init)
+        nominal_z = self.sys.reset(rng=None).z
+        faulty_z = self.sys.reset(rng=rng_fault).z
+        T1 = int(self.t_fault * len(self.ref_y))
+        T2 = len(self.ref_y) - T1
 
-        def sim_step(carry, inputs):
-            x, est, ut = carry
-            key, y_ref, u_ref, x_ref = inputs
-
-            key_step, key_act = jr.split(key)
-            ut = self.mpc.update_ut(ut, est.mean, y_ref, u_ref, x_ref)
-            u = ut[0]
-
-            if det_policy:
-                key_act = None
-            a, log_p = self.policy.sample((est, ut), key=key_act)
-            if not use_policy:
-                a = 0.0 * a
-
-            x_next, y = self.system.step(x, u + a, key=key_step)
-            est_next = self.observer.update_est(est, u + a, y)
-
-            out = SimStep(x, est, ut, u, a, log_p, x_next, est_next, y)
-            return (x_next, est_next, ut), out
-
-        key_init, key_steps1, key_steps2 = jr.split(key, 3)
-        t_fault = t_fault if t_fault > 1 else int(t_fault * len(y_ref))
-        (x, est, ut) = init_sim_state(key_init)
-        inputs1 = prepare_inputs(
-            key_steps1, y_ref[:t_fault], u_ref[:t_fault], x_ref[:t_fault]
-        )
-        inputs2 = prepare_inputs(
-            key_steps2, y_ref[t_fault:], u_ref[t_fault:], x_ref[t_fault:]
+        # fault free phase
+        sim = sim.replace(sys=sim.sys.replace(z=nominal_z))
+        sim, steps1 = jax.lax.scan(
+            partial(scan_fn, use_aux=False), sim, jr.split(rng_steps1, T1)
         )
 
-        (x, est, ut), rollout1 = jax.lax.scan(sim_step, (x, est, ut), inputs1)
-        x = self.system.reset_fault(x, key=key_steps2)
-        (x, est, ut), rollout2 = jax.lax.scan(sim_step, (x, est, ut), inputs2)
-
-        rollout = jax.tree_map(lambda x, y: jnp.concat([x, y]), rollout1, rollout2)
-
-        rewards = eqx.filter_vmap(self.get_reward)(rollout, y_ref, u_ref, x_ref)
-        V, A = self.policy.estimate_V_and_A_gae(
-            (rollout.est, rollout.ut), rewards, V_last=self.policy.value((est, ut))
+        # fault phase
+        sim = sim.replace(sys=sim.sys.replace(z=faulty_z))
+        sim, steps2 = jax.lax.scan(
+            partial(scan_fn, use_aux=False), sim, jr.split(rng_steps2, T2)
         )
-        return rollout, rewards, V, A
+        steps = jax.tree.map(lambda *xs: jnp.concatenate(xs), steps1, steps2)
+        return steps
+
+        # rewards = self.get_reward(steps_out, self.ref_y, self.ref_u)
+        return state, steps_out, rewards
+
+    def plot(self, rollout):
+        import matplotlib.pyplot as plt
+
+        def plot(v, name: str, ref=None, est=None):
+            t = list(range(len(v)))
+            if est is not None:
+                mean, cov = est
+                plt.plot(mean, label="est", color="tab:orange")
+                plt.fill_between(
+                    t, mean - cov, mean + cov, alpha=0.5, color="tab:orange"
+                )
+            plt.plot(v, label=name)
+            if ref is not None:
+                plt.plot(ref, "k:", label="ref")
+            plt.vlines(int(len(t) * self.t_fault), *plt.ylim(), color="r")
+            plt.legend()
+            plt.grid(True)
+
+        state, out = rollout
+        x = state.sys.x
+        z = state.sys.z
+        est_mean = state.kf.x
+        est_cov = state.kf.P
+
+        plt.figure(figsize=(20, 10))
+        for i in range(z.shape[-1]):
+            plt.subplot(z.shape[-1], 4, 4 * i + 1)
+            plot(v=z[:, i], name=f"$z_{i}$", est=(est_mean[:, i], est_cov[:, i, i]))
+        for i in range(x.shape[-1]):
+            plt.subplot(x.shape[-1], 4, 4 * (x.shape[-1] - i - 1) + 2)
+            est = est_mean[:, -i - 1]
+            cov = est_cov[:, -i - 1, -i - 1]
+            plot(v=x[:, -i - 1], name=f"$x_{x.shape[-1]-i}$", est=(est, cov))
+        for i in range(out.u.shape[-1]):
+            plt.subplot(out.u.shape[-1], 4, 4 * i + 3)
+            plot(v=out.u[:, i], name=f"$u_{i}$")
+            plot(v=out.a[:, i], name=f"$a_{i}$", ref=self.ref_u[:, i])
+        for i in range(out.y.shape[-1]):
+            plt.subplot(out.y.shape[-1], 4, 4 * i + 4)
+            plot(v=out.y[:, i], name=f"$y_{i}$", ref=self.ref_y[:, i])
+        plt.show()

@@ -1,58 +1,45 @@
-from jaxtyping import Float, Array
+from jaxtyping import Float, Array, Key
 import jax
 import jax.numpy as jnp
 import equinox as eqx
-import systems
+from utils import Module, RESET
+from systems import DSSM
 
 
-class Observer[ObserverState](eqx.Module):
-    def reset(self) -> ObserverState:
-        raise NotImplementedError
+class KalmanFilter(Module):
+    x: Float[Array, "x"] = eqx.field(init=False, default_factory=RESET)
+    P: Float[Array, "x x"] = eqx.field(init=False, default_factory=RESET)
 
-    def estimate(self, state: ObserverState, *args, **kwargs) -> systems.State:
-        raise NotImplementedError
+    sys: DSSM = eqx.field(static=True)
+    Q: Float[Array, "x x"] = eqx.field(static=True)
+    R: Float[Array, "y y"] = eqx.field(static=True)
 
-    def update(self, state: ObserverState, *args, **kwargs) -> ObserverState:
-        raise NotImplementedError
+    def __call__(self) -> Float[Array, "x"]:
+        return self.x
 
-
-class KalmanState(eqx.Module):
-    x: Float[Array, "x"]
-    P: Float[Array, "x x"]
-
-
-class KalmanFilter(Observer[KalmanState]):
-    sys: systems.Dssm
-    Q: Float[Array, "x x"]
-    R: Float[Array, "y y"]
-
-    def reset(self):
-        return KalmanState(
-            x=self.sys.reset(rng=None),
+    def reset(self, *, rng: Key | None):
+        return self.replace(
+            x=self.sys.reset(rng=None).x,
             P=jnp.eye(self.sys.x_dim),
         )
 
-    def estimate(self, state: KalmanState):
-        return state.x
-
-    def update(self, state: KalmanState, u: Float[Array, "u"], y: Float[Array, "y"]):
-        A, C, dx, dy = self.linearized_step(state.x, u)
+    def update(self, u: Float[Array, "u"], y: Float[Array, "y"]):
+        A, C, dx, dy = self.linearized_step(self.x, u)
         # a posteriori update
-        K = state.P @ C.T @ jnp.linalg.inv(C @ state.P @ C.T + self.R)
-        state = KalmanState(
-            x=state.x + K @ (y - C @ state.x - dy),
-            P=state.P - K @ C @ state.P,
+        K = self.P @ C.T @ jnp.linalg.inv(C @ self.P @ C.T + self.R)
+        self = self.replace(
+            x=self.x + K @ (y - C @ self.x - dy),
+            P=self.P - K @ C @ self.P,
         )
         # a priori update
-        state = KalmanState(
-            x=A @ state.x + dx,
-            P=A @ state.P @ A.T + self.Q,
+        return self.replace(
+            x=A @ self.x + dx,
+            P=A @ self.P @ A.T + self.Q,
         )
-        return state
 
     def linearized_step(self, x: Float[Array, "x"], u: Float[Array, "u"]):
-        A, C = jax.jacobian(lambda x: self.sys.step(x, u))(x)
-        dx, dy = self.sys.step(x, u)
+        A, C = jax.jacobian(lambda x: self.sys(x, u, rng=None))(x)
+        dx, dy = self.sys(x, u, rng=None)
         dx = dx - A @ x
         dy = dy - C @ x
         return A, C, dx, dy

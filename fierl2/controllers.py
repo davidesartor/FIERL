@@ -1,71 +1,51 @@
-from jaxtyping import Float, Array
+from jaxtyping import Float, Array, Key
 import jax
 import jax.numpy as jnp
 import equinox as eqx
-from einops import einsum  # TODO use einsum instead of flatten + matmul
-import systems
+from utils import Module, RESET
+from systems import DSSM
 
 
-class Controller[ControllerState](eqx.Module):
-    def reset(self) -> ControllerState:
-        raise NotImplementedError
+class MPC(Module):
+    ut: Float[Array, "t u"] = eqx.field(init=False, default_factory=RESET)
 
-    def control(self, state: ControllerState, *args, **kwargs):
-        raise NotImplementedError
+    sys: DSSM = eqx.field(static=True)
+    Jy: Float[Array, "y y"] = eqx.field(static=True)
+    Ju: Float[Array, "u u"] = eqx.field(static=True)
+    horizon: int = eqx.field(static=True)
+    discount: float = eqx.field(static=True)
 
-    def update(self, state: ControllerState, *args, **kwargs) -> ControllerState:
-        raise NotImplementedError
+    def __call__(self) -> Float[Array, "u"]:
+        return self.ut[0]
 
-
-class MpcState(eqx.Module):
-    u: Float[Array, "u"]
-    previous_sol: Float[Array, "t u"]
-
-
-class Mpc(Controller[MpcState]):
-    sys: systems.Dssm
-    horizon: int
-    discount: float
-    Jy: Float[Array, "y y"]
-    Ju: Float[Array, "u u"]
-    Jy_cal: Float[Array, "ny ny"] = eqx.field(init=False)
-    Ju_cal: Float[Array, "nu nu"] = eqx.field(init=False)
-
-    def __post_init__(self):
-        disc = jnp.diag(self.discount ** jnp.arange(self.horizon))
-        self.Jy_cal = jnp.kron(disc, self.Jy)
-        self.Ju_cal = jnp.kron(disc, self.Ju)
-
-    def reset(self):
-        ut = jnp.zeros((self.horizon, self.sys.u_dim))
-        return MpcState(previous_sol=ut, u=ut[0])
-
-    def control(self, state: MpcState):
-        return state.u
+    def reset(self, *, rng: Key | None):
+        return self.replace(ut=jnp.zeros((self.horizon, self.sys.u_dim)))
 
     def update(
         self,
-        state: MpcState,
         x: Float[Array, "x"],
-        ref_y: Float[Array, "n y"],
-        ref_u: Float[Array, "n u"],
+        ref_y: Float[Array, "t y"],
+        ref_u: Float[Array, "t u"],
     ):
-        ut = jnp.roll(state.previous_sol, -1, axis=-2).at[-1].set(ref_u[-1])
+        ut = jnp.roll(self.ut, -1, axis=-2).at[-1].set(ref_u[-1])
 
         # find optimal control
         D, dy = self.linearized_trajectory(ut, x)
+        Ju = jnp.kron(jnp.diag(self.discount ** jnp.arange(self.horizon)), self.Ju)
+        Jy = jnp.kron(jnp.diag(self.discount ** jnp.arange(self.horizon)), self.Jy)
 
         ut = jnp.linalg.solve(
-            a=D.T @ self.Jy_cal @ D + self.Ju_cal,
-            b=(
-                D.T @ self.Jy_cal @ (ref_y.flatten() - dy)
-                + self.Ju_cal @ ref_u.flatten()
-            ),
+            a=D.T @ Jy @ D + Ju,
+            b=(D.T @ Jy @ (ref_y.flatten() - dy) + Ju @ ref_u.flatten()),
         ).reshape(ut.shape)
-        return MpcState(u=ut[0], previous_sol=ut)
+        return self.replace(ut=ut)
 
     def linearized_trajectory(self, ut: Float[Array, "t u"], x: Float[Array, "x"]):
-        trajectory = lambda ut: jax.lax.scan(self.sys.step, x, ut)[1]
+        def trajectory(ut):
+            step = lambda x, u: self.sys(x, u, rng=None)
+            _, yt = jax.lax.scan(step, x, ut)
+            return yt
+
         D = jax.jacobian(trajectory)(ut)
         D = D.reshape(-1, ut.flatten().size)
         dy = trajectory(ut).flatten() - D @ ut.flatten()

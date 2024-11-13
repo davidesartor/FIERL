@@ -1,111 +1,197 @@
-from jaxtyping import Float, Array
+from typing import Self
+from jaxtyping import Float, Array, Key
 import jax
 import jax.numpy as jnp
 import jax.random as jr
 import equinox as eqx
-
-State = Float[Array, "x"]
-Control = Float[Array, "u"]
-Output = Float[Array, "y"]
-Fault = Float[Array, "z"]
+from utils import Module, RESET
 
 
-class Dssm(eqx.Module):
-    x_dim: eqx.AbstractVar[int]
-    u_dim: eqx.AbstractVar[int]
-    y_dim: eqx.AbstractVar[int]
+class DSSM(Module):
+    x: Float[Array, "x"] = eqx.field(init=False, default_factory=RESET)
+    x_dim: int = eqx.field(static=True, init=False)
+    u_dim: int = eqx.field(static=True, init=False)
+    y_dim: int = eqx.field(static=True, init=False)
 
-    def reset(self, *, rng=None) -> State:
+    def __call__(
+        self, x: Float[Array, "x"], u: Float[Array, "u"], *, rng: Key | None
+    ) -> tuple[Float[Array, "x"], Float[Array, "y"]]:
         raise NotImplementedError
 
     def step(
-        self, x: Float[Array, "x"], u: Control, *, rng=None
-    ) -> tuple[State, Output]:
-        raise NotImplementedError
+        self, u: Float[Array, "u"], *, rng: Key | None
+    ) -> tuple[Self, Float[Array, "y"]]:
+        x, y = self(self.x, u, rng=rng)
+        return self.replace(x=x), y
 
 
-class FaultyDssm(eqx.Module):
-    z_dim: eqx.AbstractVar[int]
-    x_dim: eqx.AbstractVar[int]
-    u_dim: eqx.AbstractVar[int]
-    y_dim: eqx.AbstractVar[int]
+class Cascade(DSSM):
+    x_dim: int = eqx.field(static=True, default=3)
+    u_dim: int = eqx.field(static=True, default=1)
+    y_dim: int = eqx.field(static=True, default=1)
 
-    def reset(self, *, rng=None) -> tuple[Fault, State]:
+    flow_coeff: float = eqx.field(static=True, default=0.5)
+
+    x_noise_std: float = eqx.field(static=True, default=1e-2)
+    y_noise_std: float = eqx.field(static=True, default=1e-2)
+
+    def __call__(
+        self, x: Float[Array, "x"], u: Float[Array, "u"], *, rng: Key | None
+    ) -> tuple[Float[Array, "x"], Float[Array, "y"]]:
+        flows = self.flow_coeff * x
+        x = x.at[0].add(u.sum() - flows[0])
+        x = x.at[1:].add(flows[:-1] - flows[1:])
+        y = flows[-1] * jnp.ones(self.y_dim)
+
+        if rng is not None:
+            rng_x, rng_y = jr.split(rng)
+            x = x + self.x_noise_std * jr.normal(rng_x, x.shape)
+            y = y + self.y_noise_std * jr.normal(rng_y, y.shape)
+        return x, y
+
+    def reset(self, *, rng: Key | None):
+        x = jnp.zeros(self.x_dim)
+        if rng is not None:
+            x = x + jr.normal(rng, x.shape)
+        return self.replace(x=x)
+
+
+class FDSSM(Module):
+    z: Float[Array, "z"] = eqx.field(init=False, default_factory=RESET)
+    x: Float[Array, "x"] = eqx.field(init=False, default_factory=RESET)
+    z_dim: int = eqx.field(static=True, init=False)
+    x_dim: int = eqx.field(static=True, init=False)
+    u_dim: int = eqx.field(static=True, init=False)
+    y_dim: int = eqx.field(static=True, init=False)
+
+    def __call__(
+        self,
+        z: Float[Array, "z"],
+        x: Float[Array, "x"],
+        u: Float[Array, "u"],
+        *,
+        rng: Key | None,
+    ) -> tuple[Float[Array, "z"], Float[Array, "x"], Float[Array, "y"]]:
         raise NotImplementedError
 
     def step(
-        self, z: Fault, x: State, u: Control, *, rng=None
-    ) -> tuple[Fault, State, Output]:
-        raise NotImplementedError
-
-    def as_dssm(faulty) -> Dssm:
-        class AugmentedSystem(Dssm):
-            x_dim: int = faulty.z_dim + faulty.x_dim
-            u_dim: int = faulty.u_dim
-            y_dim: int = faulty.y_dim
-
-            def step(self, x: State, u: Control, *, rng=None) -> tuple[State, Output]:
-                z, x = jnp.split(x, (faulty.z_dim,), axis=-1)
-                z, x, y = faulty.step(z, x, u, rng=rng)
-                x = jnp.concatenate([z, x], axis=-1)
-                return x, y
-
-            def reset(self, *, rng=None):
-                z, x = faulty.reset(rng=rng)
-                return jnp.concatenate([z, x], axis=-1)
-
-        return AugmentedSystem()
+        self, u: Float[Array, "u"], *, rng: Key | None
+    ) -> tuple[Self, Float[Array, "y"]]:
+        z, x, y = self(self.z, self.x, u, rng=rng)
+        return self.replace(z=z, x=x), y
 
 
-class ToyExample(FaultyDssm):
-    x_dim: int = 5
-    u_dim: int = 1
-    y_dim: int = 1
-    zu_dim: int = -1
-    zy_dim: int = -1
-    z_dim: int = 0
+def as_healty(wrapped: FDSSM) -> DSSM:
+    class Wrapper(DSSM):
+        def __post_init__(self):
+            self.x_dim = wrapped.x_dim + wrapped.z_dim
+            self.u_dim = wrapped.u_dim
+            self.y_dim = wrapped.y_dim
+            return super().__post_init__()
 
-    input_coef: float = 1.0
-    flow_coef: float = 0.5
-    output_coef: float = 1.0
+        def __call__(
+            self, x: Float[Array, "x"], u: Float[Array, "u"], *, rng: Key | None
+        ) -> tuple[Float[Array, "x"], Float[Array, "y"]]:
+            z, x = jnp.split(x, (wrapped.z_dim,), axis=-1)
+            z, x, y = wrapped(z, x, u, rng=rng)
+            x = jnp.concat([z, x], axis=-1)
+            return x, y
 
-    x_noise_cov: float = 1e-3
-    y_noise_cov: float = 1e-3
+        def reset(self, *, rng: Key | None):
+            new = wrapped.reset(rng=rng)
+            return self.replace(x=jnp.concat([new.z, new.x], axis=-1))
+
+    return Wrapper()
+
+
+def as_faulty(wrapped: DSSM) -> FDSSM:
+    class Wrapper(FDSSM):
+        def __post_init__(self):
+            self.z_dim = 0
+            self.x_dim = wrapped.x_dim
+            self.u_dim = wrapped.u_dim
+            self.y_dim = wrapped.y_dim
+            return super().__post_init__()
+
+        def __call__(
+            self,
+            z: Float[Array, "z"],
+            x: Float[Array, "x"],
+            u: Float[Array, "u"],
+            *,
+            rng: Key | None,
+        ) -> tuple[Float[Array, "z"], Float[Array, "x"], Float[Array, "y"]]:
+            x, y = wrapped(x, u, rng=rng)
+            return z, x, y
+
+        def reset(self, *, rng: Key | None):
+            new = wrapped.reset(rng=rng)
+            return self.replace(x=new.x, z=jnp.zeros((0,)))
+
+    return Wrapper()
+
+
+class ActuatorsFault(FDSSM):
+    wrapped: FDSSM = eqx.field(static=True)
 
     def __post_init__(self):
-        if self.zu_dim < 0:
-            self.zu_dim = self.u_dim
-        if self.zy_dim < 0:
-            self.zy_dim = self.y_dim
-        self.z_dim = self.zu_dim + self.zy_dim
+        self.z_dim = self.wrapped.z_dim + self.wrapped.u_dim
+        self.x_dim = self.wrapped.x_dim
+        self.u_dim = self.wrapped.u_dim
+        self.y_dim = self.wrapped.y_dim
+        return super().__post_init__()
 
-    def step(self, z, x, u, *, rng=None):
-        zu, zy = jnp.split(z, (self.zu_dim,), axis=-1)
-        inflow = self.input_coef * (u.at[: self.zu_dim].mul(zu)).sum()
-        mixflows = self.flow_coef * x[:-1]
-        outflow = self.output_coef * x[-1]
-
-        x = x.at[0].add(inflow)
-        x = x.at[:-1].add(-mixflows)
-        x = x.at[1:].add(mixflows)
-        x = x.at[-1].add(-outflow)
-
-        y = (outflow * jnp.ones(self.y_dim)).at[: self.zy_dim].add(zy)
-
-        if rng is not None:
-            kx, ky = jr.split(rng)
-            x = x + jr.normal(kx, x.shape) * self.x_noise_cov**0.5
-            y = y + jr.normal(ky, y.shape) * self.y_noise_cov**0.5
+    def __call__(
+        self,
+        z: Float[Array, "z"],
+        x: Float[Array, "x"],
+        u: Float[Array, "u"],
+        *,
+        rng: Key | None,
+    ) -> tuple[Float[Array, "z"], Float[Array, "x"], Float[Array, "y"]]:
+        zu, z = jnp.split(z, (self.wrapped.u_dim,), axis=-1)
+        u = u * zu
+        z, x, y = self.wrapped(z, x, (u * zu), rng=rng)
+        z = jnp.concat([zu, z], axis=-1)
         return z, x, y
 
-    def reset(self, *, rng=None):
-        x = jnp.zeros(self.x_dim)
-        zu = jnp.ones(self.zu_dim)
-        zy = jnp.zeros(self.zy_dim)
-        z = jnp.concatenate([zu, zy], axis=-1)
-
+    def reset(self, *, rng: Key | None):
+        zu = jnp.ones(self.wrapped.u_dim)
         if rng is not None:
-            rng_x, rng_zi, rng_dz = jr.split(rng, 3)
-            z = z.at[..., jr.choice(rng_zi, self.z_dim)].set(jr.uniform(rng_dz))
-            x = x + jr.normal(rng_x, x.shape)
-        return z, x
+            rng, rng_idx, rng_val = jr.split(rng, 3)
+            zu = zu.at[jr.choice(rng_idx, len(zu))].set(jr.uniform(rng_val))
+        wrapped = self.wrapped.reset(rng=rng)
+        return self.replace(z=jnp.concat([zu, wrapped.z], axis=-1), x=wrapped.x)
+
+
+class SensorsFault(FDSSM):
+    wrapped: FDSSM = eqx.field(static=True)
+
+    def __post_init__(self):
+        self.z_dim = self.wrapped.z_dim + self.wrapped.y_dim
+        self.x_dim = self.wrapped.x_dim
+        self.u_dim = self.wrapped.u_dim
+        self.y_dim = self.wrapped.y_dim
+        return super().__post_init__()
+
+    def __call__(
+        self,
+        z: Float[Array, "z"],
+        x: Float[Array, "x"],
+        u: Float[Array, "u"],
+        *,
+        rng: Key | None,
+    ) -> tuple[Float[Array, "z"], Float[Array, "x"], Float[Array, "y"]]:
+        zy, z = jnp.split(z, (self.wrapped.y_dim,), axis=-1)
+        z, x, y = self.wrapped(z, x, u, rng=rng)
+        y = y + zy
+        z = jnp.concat([zy, z], axis=-1)
+        return z, x, y
+
+    def reset(self, *, rng: Key | None):
+        zy = jnp.ones(self.wrapped.y_dim)
+        if rng is not None:
+            rng, rng_idx, rng_val = jr.split(rng, 3)
+            zy = zy.at[jr.choice(rng_idx, len(zy))].set(jr.uniform(rng_val))
+        wrapped = self.wrapped.reset(rng=rng)
+        return self.replace(z=jnp.concat([zy, wrapped.z], axis=-1), x=wrapped.x)
