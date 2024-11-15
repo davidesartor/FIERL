@@ -26,7 +26,7 @@ class DSSM(Module):
 
 
 class Cascade(DSSM):
-    x_dim: int = eqx.field(static=True, default=3)
+    x_dim: int = eqx.field(static=True, default=2)
     u_dim: int = eqx.field(static=True, default=1)
     y_dim: int = eqx.field(static=True, default=1)
 
@@ -52,7 +52,7 @@ class Cascade(DSSM):
     def reset(self, *, rng: Key | None):
         x = jnp.zeros(self.x_dim)
         if rng is not None:
-            x = x + jr.normal(rng, x.shape)
+            x = x + jr.uniform(rng, x.shape)
         return self.replace(x=x)
 
 
@@ -131,67 +131,69 @@ def as_faulty(wrapped: DSSM) -> FDSSM:
     return Wrapper()
 
 
-class ActuatorsFault(FDSSM):
-    wrapped: FDSSM = eqx.field(static=True)
+def faulty_actuators(wrapped: FDSSM) -> FDSSM:
+    class Wrapper(FDSSM):
+        def __post_init__(self):
+            self.z_dim = wrapped.z_dim + wrapped.u_dim
+            self.x_dim = wrapped.x_dim
+            self.u_dim = wrapped.u_dim
+            self.y_dim = wrapped.y_dim
+            return super().__post_init__()
 
-    def __post_init__(self):
-        self.z_dim = self.wrapped.z_dim + self.wrapped.u_dim
-        self.x_dim = self.wrapped.x_dim
-        self.u_dim = self.wrapped.u_dim
-        self.y_dim = self.wrapped.y_dim
-        return super().__post_init__()
+        def __call__(
+            self,
+            z: Float[Array, "z"],
+            x: Float[Array, "x"],
+            u: Float[Array, "u"],
+            *,
+            rng: Key | None,
+        ) -> tuple[Float[Array, "z"], Float[Array, "x"], Float[Array, "y"]]:
+            zu, z = jnp.split(z, (wrapped.u_dim,), axis=-1)
+            u = u * zu
+            z, x, y = wrapped(z, x, (u * zu), rng=rng)
+            z = jnp.concat([zu, z], axis=-1)
+            return z, x, y
 
-    def __call__(
-        self,
-        z: Float[Array, "z"],
-        x: Float[Array, "x"],
-        u: Float[Array, "u"],
-        *,
-        rng: Key | None,
-    ) -> tuple[Float[Array, "z"], Float[Array, "x"], Float[Array, "y"]]:
-        zu, z = jnp.split(z, (self.wrapped.u_dim,), axis=-1)
-        u = u * zu
-        z, x, y = self.wrapped(z, x, (u * zu), rng=rng)
-        z = jnp.concat([zu, z], axis=-1)
-        return z, x, y
+        def reset(self, *, rng: Key | None):
+            zu = jnp.ones(wrapped.u_dim)
+            if rng is not None:
+                rng, rng_idx, rng_val = jr.split(rng, 3)
+                zu = zu.at[jr.choice(rng_idx, len(zu))].set(jr.uniform(rng_val))
+            new = wrapped.reset(rng=rng)
+            return self.replace(z=jnp.concat([zu, new.z], axis=-1), x=new.x)
 
-    def reset(self, *, rng: Key | None):
-        zu = jnp.ones(self.wrapped.u_dim)
-        if rng is not None:
-            rng, rng_idx, rng_val = jr.split(rng, 3)
-            zu = zu.at[jr.choice(rng_idx, len(zu))].set(jr.uniform(rng_val))
-        wrapped = self.wrapped.reset(rng=rng)
-        return self.replace(z=jnp.concat([zu, wrapped.z], axis=-1), x=wrapped.x)
+    return Wrapper()
 
 
-class SensorsFault(FDSSM):
-    wrapped: FDSSM = eqx.field(static=True)
+def faulty_sensors(wrapped: FDSSM) -> FDSSM:
+    class Wrapper(FDSSM):
+        def __post_init__(self):
+            self.z_dim = wrapped.z_dim + wrapped.y_dim
+            self.x_dim = wrapped.x_dim
+            self.u_dim = wrapped.u_dim
+            self.y_dim = wrapped.y_dim
+            return super().__post_init__()
 
-    def __post_init__(self):
-        self.z_dim = self.wrapped.z_dim + self.wrapped.y_dim
-        self.x_dim = self.wrapped.x_dim
-        self.u_dim = self.wrapped.u_dim
-        self.y_dim = self.wrapped.y_dim
-        return super().__post_init__()
+        def __call__(
+            self,
+            z: Float[Array, "z"],
+            x: Float[Array, "x"],
+            u: Float[Array, "u"],
+            *,
+            rng: Key | None,
+        ) -> tuple[Float[Array, "z"], Float[Array, "x"], Float[Array, "y"]]:
+            zy, z = jnp.split(z, (wrapped.y_dim,), axis=-1)
+            z, x, y = wrapped(z, x, u, rng=rng)
+            y = y + zy
+            z = jnp.concat([zy, z], axis=-1)
+            return z, x, y
 
-    def __call__(
-        self,
-        z: Float[Array, "z"],
-        x: Float[Array, "x"],
-        u: Float[Array, "u"],
-        *,
-        rng: Key | None,
-    ) -> tuple[Float[Array, "z"], Float[Array, "x"], Float[Array, "y"]]:
-        zy, z = jnp.split(z, (self.wrapped.y_dim,), axis=-1)
-        z, x, y = self.wrapped(z, x, u, rng=rng)
-        y = y + zy
-        z = jnp.concat([zy, z], axis=-1)
-        return z, x, y
+        def reset(self, *, rng: Key | None):
+            zy = jnp.zeros(wrapped.y_dim)
+            if rng is not None:
+                rng, rng_idx, rng_val = jr.split(rng, 3)
+                zy = zy.at[jr.choice(rng_idx, len(zy))].set(jr.uniform(rng_val))
+            new = wrapped.reset(rng=rng)
+            return self.replace(z=jnp.concat([zy, new.z], axis=-1), x=new.x)
 
-    def reset(self, *, rng: Key | None):
-        zy = jnp.ones(self.wrapped.y_dim)
-        if rng is not None:
-            rng, rng_idx, rng_val = jr.split(rng, 3)
-            zy = zy.at[jr.choice(rng_idx, len(zy))].set(jr.uniform(rng_val))
-        wrapped = self.wrapped.reset(rng=rng)
-        return self.replace(z=jnp.concat([zy, wrapped.z], axis=-1), x=wrapped.x)
+    return Wrapper()
