@@ -40,7 +40,8 @@ class GaussianPolicy(nnx.Module):
     def sample(self, obs: Float[Array, "o"]):
         mu, cov = self(obs)
         a = jr.multivariate_normal(self.rngs(), mu, cov)
-        return a
+        log_p = jnp.array(multivariate_normal.logpdf(a, mu, cov))
+        return a, log_p
 
     def eval(self, obs: Float[Array, "o"], a: Float[Array, "a"]):
         mu, cov = self(obs)
@@ -55,9 +56,9 @@ class Trainer(nnx.Module):
         env,
         discount: float = 0.99,
         gae_lambda: float = 0.95,
-        clip_pi: float = 0.3,
+        clip_pi: float = 0.1,
         clip_vf: float = 1.0,
-        entropy_weight: float = 0.0,
+        entropy_weight: float = 0.0001,
         normalize_advantages: bool = True,
         *,
         rngs: nnx.Rngs,
@@ -78,8 +79,8 @@ class Trainer(nnx.Module):
         self,
         epochs: int,
         episode_length: int,
-        lr: float = 1e-4,
-        wd: float = 1e-3,
+        lr: float = 3e-4,
+        wd: float = 1e-4,
         pool_size: int = 256,
     ):
         self.optimizer_pi = nnx.Optimizer(self.policy, optax.adamw(lr, weight_decay=wd))
@@ -88,18 +89,18 @@ class Trainer(nnx.Module):
         logger = Logger()
         for i in (pbar := tqdm(range(epochs))):
             steps, log_p = self.get_rollouts(pool_size, episode_length)
-            V0, V_target, A = self.estimate_V_A(steps.obs, steps.r, steps.next_obs)
+            V, A = self.estimate_V_A(steps.obs, steps.r, steps.next_obs)
             if self.normalize_advantages:
                 A = (A - A.mean()) / (A.std() + 1e-8)
 
             for _ in range(10):
                 loss_pi = self.policy_optimization_step(steps.obs, steps.a, log_p, A)
-                loss_vf = self.value_optimization_step(steps.obs, V0, V_target)
+                loss_vf = self.value_optimization_step(steps.obs, V)
                 logger.log(loss_vf=loss_vf, loss_pi=loss_pi)
 
-            logger.log(reward=steps.r, V=V0, A=A, loss_pi=loss_pi, loss_vf=loss_vf)
+            logger.log(reward=steps.r, V=V, A=A, loss_pi=loss_pi, loss_vf=loss_vf)
             pbar.set_postfix(
-                V0=V0.mean().item(),
+                V=V.mean().item(),
                 loss_pi=loss_pi.mean().item(),
                 loss_vf=loss_vf.mean().item(),
                 reward=steps.r.mean().item(),
@@ -142,7 +143,7 @@ class Trainer(nnx.Module):
         delta = rewards - V[:-1] + self.discount * V[1:]
         _, A = jax.lax.scan(tail_sum_step, jnp.zeros(()), delta, reverse=True)
         V_target = V[:-1] + A
-        return V[:-1], V_target, A
+        return V_target, A
 
     @nnx.jit
     def policy_optimization_step(
@@ -171,14 +172,12 @@ class Trainer(nnx.Module):
     def value_optimization_step(
         self,
         obs: Float[Array, "n t o"],
-        V0: Float[Array, "n t"],
         V_target: Float[Array, "n t"],
     ):
         @nnx.value_and_grad
         def loss(vf):
             V = jax.vmap(jax.vmap(vf))(obs).squeeze(-1)
-            # V = V0 + tanh_clip(V - V0, self.clip_vf)
-            # delta = tanh_clip(V - V_target, self.clip_vf)
+            delta = tanh_clip(V - V_target, self.clip_vf)
             delta = V - V_target
             return optax.l2_loss(delta).mean()
 

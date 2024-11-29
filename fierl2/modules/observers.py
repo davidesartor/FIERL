@@ -1,47 +1,64 @@
-from jaxtyping import Float, Array, Key
-import jax
-import jax.numpy as jnp
-import jax.random as jr
+from utils import *
 from flax import nnx
-from systems import DSSM
 
 
 class KalmanFilter(nnx.Module):
     def __init__(
         self,
-        sys: DSSM,
-        Q: Float[Array, "x x"] | Float[Array, "x"] | float,
+        sys: FDSSM,
+        Qz: Float[Array, "z z"] | Float[Array, "z"] | float,
+        Qx: Float[Array, "x x"] | Float[Array, "x"] | float,
         R: Float[Array, "y y"] | Float[Array, "y"] | float,
+        mc_samples_init: int = 0,
+        *,
+        rngs: nnx.Rngs,
     ):
-        self.sys_step = sys.step
-        self.Q = nnx.Param(jnp.eye(sys.x_dim) * Q)
+        self.sys = sys
+        self.mc_samples_init = mc_samples_init
+        Zeros = jnp.zeros((sys.z_dim, sys.x_dim))
+        Q = [
+            [jnp.eye(sys.z_dim) * Qz, Zeros],
+            [Zeros.T, jnp.eye(sys.x_dim) * Qx],
+        ]
+        self.Q = nnx.Param(jnp.block(Q))
         self.R = nnx.Param(jnp.eye(sys.y_dim) * R)
 
-        self.x_hat = nnx.Variable(jnp.zeros((sys.x_dim,)))
-        self.P = nnx.Variable(jnp.eye(sys.x_dim))
+        self.rngs = rngs
+        self.z = nnx.Variable(jnp.zeros((sys.z_dim,)))
+        self.x = nnx.Variable(jnp.zeros((sys.x_dim,)))
+        self.P = nnx.Variable(jnp.eye(sys.z_dim + sys.x_dim))
 
     def reset(self):
-        # sys_reset = lambda m, _: (m.reset(), m.x.value)
-        # _, x = nnx.scan(sys_reset)(self.sys, jnp.empty(10))
-        # self.P.value = jnp.einsum("ki,kj->ij", x, x) + self.Q.value
-        # self.x_hat.value = x.mean(axis=0)
-        self.x_hat.value = jnp.zeros((self.x_hat.shape[-1],))
-        self.P.value = jnp.eye(self.x_hat.shape[-1])
+        if not self.mc_samples_init:
+            self.z.value, self.x.value = self.sys.reset(rng=None)
+            self.P.value = jnp.eye(self.P.value.shape[-1])
+        else:
+            z, x = jax.vmap(self.sys.reset)(jr.split(self.rngs(), self.mc_samples_init))
+            x_aug = jnp.concatenate([z, x], axis=-1)
+            self.z.value = jnp.mean(z, axis=0)
+            self.x.value = jnp.mean(x, axis=0)
+            self.P.value = jnp.cov(x_aug.T)
 
-    def update(self, u: Float[Array, "u"], y: Float[Array, "y"]):
+    def step(self, u: Float[Array, "u"], y: Float[Array, "y"]):
         # linearize sys step
-        sys_step = lambda x: self.sys_step(x, u, rng=None)
-        A, C = jax.jacobian(sys_step)(self.x_hat.value)
-        dx, dy = sys_step(self.x_hat)
-        dx = dx - A @ self.x_hat
-        dy = dy - C @ self.x_hat
+        def aug_step(x_aug):
+            z, x = jnp.split(x_aug, [self.sys.z_dim])
+            z, x, y = self.sys(z, x, u, rng=None)
+            return jnp.concatenate([z, x]), y
+
+        x_aug = jnp.concatenate([self.z.value, self.x.value], axis=-1)
+        A, C = jax.jacobian(aug_step)(x_aug)
+        dx, dy = aug_step(x_aug)
+        dx = dx - A @ x_aug
+        dy = dy - C @ x_aug
+
         # a posteriori update
         K = self.P @ C.T @ jnp.linalg.inv(C @ self.P @ C.T + self.R)
-        self.x_hat.value = self.x_hat + K @ (y - C @ self.x_hat - dy)
+        x_aug = x_aug + K @ (y - C @ x_aug - dy)
         self.P.value = self.P - K @ C @ self.P
-        # a priori update
-        self.x_hat.value = A @ self.x_hat + dx
-        self.P.value = A @ self.P @ A.T + self.Q
 
-    def __call__(self) -> Float[Array, "x"]:
-        return self.x_hat.value
+        # a priori update
+        x_aug = A @ x_aug + dx
+        self.P.value = A @ self.P @ A.T + self.Q
+        self.z.value, self.x.value = jnp.split(x_aug, [self.sys.z_dim])
+        return self.z.value, self.x.value
