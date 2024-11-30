@@ -1,3 +1,4 @@
+from .systems import FDSSM
 from utils import *
 from flax import nnx
 
@@ -25,12 +26,14 @@ class MPC(nnx.Module):
         horizon: int = 16,
         discount: float = 0.9,
         mc_samples_traj: int = 0,
+        u_range: tuple[float, float] | None = (-10.0, 10.0),
         *,
         rngs: nnx.Rngs,
     ):
         self.sys = sys
         self.horizon = horizon
         self.discount = discount
+        self.u_range = u_range
         self.mc_samples_traj = mc_samples_traj
 
         self.J = nnx.Param(J)
@@ -61,7 +64,8 @@ class MPC(nnx.Module):
         ut_flat = ut.flatten()
         H = jax.hessian(cost_fn)(ut_flat)
         J = jax.grad(cost_fn)(ut_flat)
-        self.ut.value = jnp.linalg.solve(a=H, b=H @ ut_flat - J).reshape(ut.shape)
+        ut = jnp.linalg.solve(a=H, b=H @ ut_flat - J).reshape(ut.shape)
+        self.ut.value = ut.clip(*self.u_range)
         u = self.ut.value[0]
         return u
 

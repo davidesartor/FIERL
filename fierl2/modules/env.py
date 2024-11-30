@@ -1,14 +1,8 @@
-from flax import nnx
 from utils import *
-from modules.systems import FDSSM, SysModule
-from modules.controllers import MPC, ControlCostMatrices, References
-from modules.observers import KalmanFilter
-
-
-class AuxCostMatrices(NamedTuple):
-    a: Float[Array, "a a"] | Float[Array, "a"] | float
-    z: Float[Array, "z z"] | Float[Array, "z"] | float
-    x: Float[Array, "x x"] | Float[Array, "x"] | float
+from .systems import FDSSM, SysModule
+from .controllers import MPC, ControlCostMatrices, References
+from .observers import KalmanFilter
+from flax import nnx
 
 
 class Simulator(nnx.Module):
@@ -18,8 +12,9 @@ class Simulator(nnx.Module):
         t_aux_on: int = 0,
         t_aux_off: int = -1,
         ref=References(y=1.0, u=0.0, x=0.0, z=0.0),
-        Jcontrol=ControlCostMatrices(y=1.0, du=1.0, u=1e-6, x=0.0, z=0.0),
-        Jaux=AuxCostMatrices(a=1.0, z=1.0, x=0.0),
+        Jcontrol=ControlCostMatrices(y=1.0, du=0.01, u=0.01, x=0.0, z=0.0),
+        Jzest: Float[Array, "z z"] | Float[Array, "z"] | float = 1.0,
+        Jxest: Float[Array, "x x"] | Float[Array, "x"] | float = 0.0,
         kalman_params: dict = dict(Qz=1e-8, Qx=1e-2, R=1e-2, mc_samples_init=0),
         mpc_params: dict = dict(horizon=16, discount=0.9, mc_samples_traj=0),
         *,
@@ -32,7 +27,8 @@ class Simulator(nnx.Module):
         # costs and references
         self.ref = nnx.Param(ref)
         self.Jcontrol = nnx.Param(Jcontrol)
-        self.Jaux = nnx.Param(Jaux)
+        self.Jzest = nnx.Param(Jzest)
+        self.Jxest = nnx.Param(Jxest)
 
         # modules and state
         self.rngs = rngs
@@ -77,17 +73,17 @@ class Simulator(nnx.Module):
         self.t.value += 1
         return dict(z=z, x=x, z_hat=z_hat, x_hat=x_hat, P=P, u=u, a=a, y=y)
 
-    def rewards(self, outs: dict):
+    def rewards_and_costs(self, outs: dict):
         z, x, z_hat, x_hat, P, u, a, y = (
             outs[k] for k in ["z", "x", "z_hat", "x_hat", "P", "u", "a", "y"]
         )
-        cost = (
-            self.mpc.control_cost(zt=z, xt=x, ut=u, yt=y, ref=self.ref.value)
-            + quadratic_cost(a, self.Jaux.value.a)
-            + quadratic_cost(z_hat - z, self.Jaux.value.z)
-            + quadratic_cost(x_hat - x, self.Jaux.value.x)
+        reward = -(
+            +quadratic_cost(z_hat - z, self.Jzest.value)
+            + quadratic_cost(x_hat - x, self.Jxest.value)
         )
-        return -cost
+        cost = self.mpc.control_cost(zt=z, xt=x, ut=u + a, yt=y, ref=self.ref.value)
+
+        return reward, cost
 
     @nnx.jit(static_argnames=("episode_length",))
     def rollout(self, policy, episode_length: int):
@@ -115,10 +111,12 @@ class Simulator(nnx.Module):
             (self, policy), jnp.arange(Ton, Toff)
         )
         next_obs = jnp.roll(obs, -1).at[-1].set(self.obs())
-        rollout = Rollout(obs, a, log_p, self.rewards(outs2), next_obs)
+        rewards, costs = self.rewards_and_costs(outs2)
 
         # phase 3: aux off
         self, outs3 = aux_off_step(self, jnp.arange(Toff, episode_length))
+
+        rollout = Rollout(obs, a, log_p, rewards, next_obs, costs)
         outs = jax.tree.map(lambda *x: jnp.concat(x), outs1, outs2, outs3)
         return rollout, outs
 

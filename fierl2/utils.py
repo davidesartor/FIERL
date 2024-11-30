@@ -3,6 +3,22 @@ from jaxtyping import Float, Array, Key
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+from flax import nnx
+
+
+class MLP(nnx.Sequential):
+    def __init__(self, in_dim, out_dim, hidden_dim=64, *, rngs: nnx.Rngs):
+        super().__init__(
+            nnx.Linear(in_dim, hidden_dim, rngs=rngs),
+            nnx.gelu,
+            nnx.RMSNorm(hidden_dim, rngs=rngs),
+            nnx.Linear(hidden_dim, hidden_dim, rngs=rngs),
+            nnx.gelu,
+            nnx.RMSNorm(hidden_dim, rngs=rngs),
+            nnx.Linear(
+                hidden_dim, out_dim, rngs=rngs, kernel_init=nnx.initializers.zeros
+            ),
+        )
 
 
 class Logger(dict):
@@ -16,6 +32,26 @@ class Logger(dict):
         return {key: jnp.array(value) for key, value in self.items()}
 
 
+class Rollout(NamedTuple):
+    obs: Float[Array, "..."]
+    a: Float[Array, "u"]
+    log_p: Float[Array, ""]
+    r: Float[Array, ""]
+    next_obs: Float[Array, "..."]
+    c: Float[Array, ""] = jnp.zeros(())
+
+
+def get_returns(
+    r: Float[Array, "t"], discount: float
+) -> tuple[Float[Array, ""], Float[Array, ""]]:
+    def scansum_step(v, xi):
+        v = xi + discount * v
+        return v, v
+
+    J0, Jt = jax.lax.scan(scansum_step, jnp.zeros(()), r, reverse=True)
+    return J0, Jt
+
+
 def quadratic_cost(
     s: Float[Array, "t d"], J: Float[Array, "d d"] | Float[Array, "d"] | float
 ) -> Float[Array, "t"]:
@@ -25,79 +61,6 @@ def quadratic_cost(
     return jnp.sum(J * s**2, axis=-1)
 
 
-def tanh_clip(x, c):
+def tanh_clip(x: Float[Array, "..."], neg: float, pos: float | None = None):
+    c = jnp.where(x < 0.0, neg, pos or neg)
     return jnp.tanh(x / c) * c
-
-
-class Rollout(NamedTuple):
-    obs: Float[Array, "..."]
-    a: Float[Array, "u"]
-    log_p: Float[Array, ""]
-    r: Float[Array, ""]
-    next_obs: Float[Array, "..."]
-
-
-class DSSM(Protocol):
-    x_dim: int
-    u_dim: int
-    y_dim: int
-
-    def reset(self, rng: Key | None) -> Float[Array, "x"]:
-        raise NotImplementedError
-
-    def __call__(
-        self, x: Float[Array, "x"], u: Float[Array, "u"], *, rng: Key | None
-    ) -> tuple[Float[Array, "x"], Float[Array, "y"]]:
-        raise NotImplementedError
-
-    def trajectory(
-        self, x0: Float[Array, "x"], ut: Float[Array, "t u"], *, rng: Key | None
-    ):
-        def scan_fn(x, inputs):
-            u, k = inputs
-            k = None if rng is None else k
-            x, y = self(x, u, rng=k)
-            return x, (x, y)
-
-        keys = jr.split((jr.key(0) if rng is None else rng), len(ut))
-        _, (xt, yt) = jax.lax.scan(scan_fn, x0, (ut, keys))
-        return xt, yt
-
-
-class FDSSM(Protocol):
-    z_dim: int
-    x_dim: int
-    u_dim: int
-    y_dim: int
-
-    def reset(self, rng: Key | None) -> tuple[Float[Array, "z"], Float[Array, "x"]]:
-        raise NotImplementedError
-
-    def __call__(
-        self,
-        z: Float[Array, "z"],
-        x: Float[Array, "x"],
-        u: Float[Array, "u"],
-        *,
-        rng: Key | None
-    ) -> tuple[Float[Array, "z"], Float[Array, "x"], Float[Array, "y"]]:
-        raise NotImplementedError
-
-    def trajectory(
-        self,
-        z0: Float[Array, "z"],
-        x0: Float[Array, "x"],
-        ut: Float[Array, "t u"],
-        *,
-        rng: Key | None
-    ):
-        def scan_fn(carry, inputs):
-            z, x = carry
-            u, k = inputs
-            k = None if rng is None else k
-            z, x, y = self(z, x, u, rng=k)
-            return (z, x), (z, x, y)
-
-        keys = jr.split((jr.key(0) if rng is None else rng), len(ut))
-        _, (zt, xt, yt) = jax.lax.scan(scan_fn, (z0, x0), (ut, keys))
-        return zt, xt, yt
