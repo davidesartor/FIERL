@@ -25,8 +25,9 @@ class MPC(nnx.Module):
         J: ControlCostMatrices,
         horizon: int = 16,
         discount: float = 0.9,
+        newton_iters: int = 1,
         mc_samples_traj: int = 0,
-        u_range: tuple[float, float] | None = (-10.0, 10.0),
+        u_range: tuple[float, float] = (-5.0, 5.0),
         *,
         rngs: nnx.Rngs,
     ):
@@ -34,6 +35,7 @@ class MPC(nnx.Module):
         self.horizon = horizon
         self.discount = discount
         self.u_range = u_range
+        self.newton_iters = newton_iters
         self.mc_samples_traj = mc_samples_traj
 
         self.J = nnx.Param(J)
@@ -41,31 +43,48 @@ class MPC(nnx.Module):
         self.rngs = rngs
         self.ut = nnx.Variable(jnp.zeros((horizon, sys.u_dim)))
 
-    def reset(self):
-        self.ut.value = jnp.zeros_like(self.ut.value)
+    def reset(self, deterministic=False):
+        if deterministic:
+            self.ut.value = jnp.zeros_like(self.ut.value)
+        else:
+            umin, umax = self.u_range
+            self.ut.value = 0.1 * jr.uniform(
+                self.rngs(), self.ut.shape, minval=umin, maxval=umax
+            )
+
+    def flat_state(self):
+        return self.ut.value.reshape(*self.ut.shape[:-2], -1)
 
     def step(
         self, z0: Float[Array, "z"], x0: Float[Array, "x"], ref: References
     ) -> Float[Array, "u"]:
+        # roll foward for warm start and preflatten
+        ut_flat = jnp.roll(self.ut.value, -1).at[-1].set(self.ut.value[-1]).flatten()
+
+        # optimization objective (either deterministic or monte carlo estimation)
         def cost_fn(ut_flat):
-            def cost_single_sim(ut, rng):
-                zt, xt, yt = self.sys.trajectory(z0, x0, ut, rng=rng)
+            def cost_single_sim(ut, wt):
+                zt, xt, yt = self.sys.trajectory(z0, x0, ut, wt)
                 cost_t = self.control_cost(zt, xt, ut, yt, ref, u0=self.ut[0])
                 return jnp.sum(cost_t * self.discount ** jnp.arange(self.horizon))
 
             ut = ut_flat.reshape(self.ut.shape)
             if not self.mc_samples_traj:
-                return cost_single_sim(ut, rng=None)
-            rngs = jr.split(self.rngs(), self.mc_samples_traj)
-            return jnp.mean(jax.vmap(cost_single_sim, in_axes=(None, 0))(ut, rngs))
+                return cost_single_sim(ut, wt=None)
 
-        # second order optimization step
-        ut = jnp.roll(self.ut.value, -1).at[-1].set(self.ut.value[-1])
-        ut_flat = ut.flatten()
-        H = jax.hessian(cost_fn)(ut_flat)
-        J = jax.grad(cost_fn)(ut_flat)
-        ut = jnp.linalg.solve(a=H, b=H @ ut_flat - J).reshape(ut.shape)
-        self.ut.value = ut.clip(*self.u_range)
+            rngs = jr.split(self.rngs(), self.mc_samples_traj * len(self.ut))
+            wt = jax.vmap(self.sys.sample_w)(rngs)
+            wt = wt.reshape(self.mc_samples_traj, len(self.ut), -1)
+            return jnp.mean(jax.vmap(cost_single_sim, in_axes=(None, 0))(ut, wt))
+
+        # second order optimization
+        for _ in range(self.newton_iters):
+            H = jax.hessian(cost_fn)(ut_flat) + 1e-8 * jnp.eye(len(ut_flat))
+            J = jax.grad(cost_fn)(ut_flat)
+            ut_flat = jnp.linalg.solve(a=H, b=H @ ut_flat - J)
+            ut_flat = ut_flat.clip(*self.u_range)
+
+        self.ut.value = ut_flat.reshape(*self.ut.shape)
         u = self.ut.value[0]
         return u
 

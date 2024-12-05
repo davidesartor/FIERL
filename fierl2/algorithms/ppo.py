@@ -1,36 +1,7 @@
-from math import prod
 from utils import *
 from tqdm import tqdm
-from jax.scipy.stats import multivariate_normal
 from flax import nnx
 import optax
-
-
-class GaussianPolicy(nnx.Module):
-    def __init__(self, obs_dim: int, a_dim: int, correlations=False, *, rngs: nnx.Rngs):
-        self.rngs = rngs
-        self.mu = MLP(obs_dim, a_dim, rngs=rngs)
-        self.std = nnx.Param(jnp.eye(a_dim) if correlations else jnp.ones((a_dim,)))
-
-    def __call__(self, obs: Float[Array, "o"]):
-        mu = self.mu(obs)
-        if self.std.ndim == 1:
-            cov = jnp.diag(self.std**2 + 1e-8)
-        elif self.std.ndim == 2:
-            cov = self.std @ self.std.T + jnp.eye(mu.shape[-1]) * 1e-8
-        return mu, cov
-
-    def sample(self, obs: Float[Array, "o"]):
-        mu, cov = self(obs)
-        a = jr.multivariate_normal(self.rngs(), mu, cov)
-        log_p = jnp.array(multivariate_normal.logpdf(a, mu, cov))
-        return a, log_p
-
-    def eval(self, obs: Float[Array, "o"], a: Float[Array, "a"]):
-        mu, cov = self(obs)
-        log_p = jnp.array(multivariate_normal.logpdf(a, mu, cov))
-        ent = 0.5 * jnp.log(jnp.linalg.det(2 * jnp.pi * jnp.e * cov))
-        return log_p, ent
 
 
 class Trainer(nnx.Module):
@@ -39,11 +10,11 @@ class Trainer(nnx.Module):
         env,
         discount: float = 0.99,
         gae_lambda: float = 0.95,
-        clip_pi: float = 0.1,
+        clip_pi: float = 0.3,
         clip_vf: float = 1.0,
         entropy_weight: float = 0.0001,
         normalize_advantages: bool = True,
-        correlations: bool = False,
+        policy_params: dict = {},
         *,
         rngs: nnx.Rngs,
     ):
@@ -58,7 +29,7 @@ class Trainer(nnx.Module):
         self.env = env
         self.value = MLP(env.obs_dim, 1, rngs=self.rngs)
         self.policy = GaussianPolicy(
-            env.obs_dim, env.a_dim, correlations, rngs=self.rngs
+            env.obs_dim, env.a_dim, **policy_params, rngs=self.rngs
         )
 
     def train(
@@ -118,8 +89,8 @@ class Trainer(nnx.Module):
         obs = jnp.concat([rollouts.obs, rollouts.next_obs[-1:]], axis=0)
         V = jax.vmap(self.value)(obs).squeeze(-1)
         delta = (rollouts.r - rollouts.c) - V[:-1] + self.discount * V[1:]
-        _, A = get_returns(delta, self.discount * self.gae_lambda)
-        V = V[:-1] + A
+        A = get_returns(delta, self.discount * self.gae_lambda)
+        V = V[:-1] + tanh_clip(A, self.clip_vf)
         return V, A
 
     @nnx.jit
@@ -148,8 +119,7 @@ class Trainer(nnx.Module):
         @nnx.value_and_grad
         def loss(vf):
             V_pred = jax.vmap(jax.vmap(vf))(rollouts.obs).squeeze(-1)
-            delta = tanh_clip(V_pred - V, self.clip_vf)
-            return optax.l2_loss(delta).mean()
+            return optax.huber_loss(V_pred, V, self.clip_vf).mean()
 
         loss, grads = loss(self.value)
         optimizer.update(grads)
