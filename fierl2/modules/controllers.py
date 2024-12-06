@@ -3,7 +3,7 @@ from utils import *
 from flax import nnx
 
 
-class References(NamedTuple):
+class Signals(NamedTuple):
     y: Float[Array, "t y"] | Float[Array, "y"] | Float[Array, ""] | float
     u: Float[Array, "t u"] | Float[Array, "u"] | Float[Array, ""] | float
     x: Float[Array, "t x"] | Float[Array, "x"] | Float[Array, ""] | float
@@ -13,7 +13,6 @@ class References(NamedTuple):
 class ControlCostMatrices(NamedTuple):
     y: Float[Array, "y y"] | Float[Array, "y"] | float
     u: Float[Array, "u u"] | Float[Array, "u"] | float
-    du: Float[Array, "u u"] | Float[Array, "u"] | float
     x: Float[Array, "x x"] | Float[Array, "x"] | float
     z: Float[Array, "z z"] | Float[Array, "z"] | float
 
@@ -26,56 +25,39 @@ class MPC(nnx.Module):
         horizon: int = 16,
         discount: float = 0.9,
         newton_iters: int = 1,
-        mc_samples_traj: int = 0,
+        integral_action: bool = True,
         u_range: tuple[float, float] = (-5.0, 5.0),
-        *,
-        rngs: nnx.Rngs,
     ):
         self.sys = sys
         self.horizon = horizon
         self.discount = discount
         self.u_range = u_range
         self.newton_iters = newton_iters
-        self.mc_samples_traj = mc_samples_traj
+        self.integral_action = integral_action
 
         self.J = nnx.Param(J)
-
-        self.rngs = rngs
         self.ut = nnx.Variable(jnp.zeros((horizon, sys.u_dim)))
 
-    def reset(self, deterministic=False):
-        if deterministic:
-            self.ut.value = jnp.zeros_like(self.ut.value)
-        else:
-            umin, umax = self.u_range
-            self.ut.value = 0.1 * jr.uniform(
-                self.rngs(), self.ut.shape, minval=umin, maxval=umax
-            )
+    def reset(self):
+        self.ut.value = jnp.zeros_like(self.ut.value)
 
     def flat_state(self):
         return self.ut.value.reshape(*self.ut.shape[:-2], -1)
 
     def step(
-        self, z0: Float[Array, "z"], x0: Float[Array, "x"], ref: References
+        self, z0: Float[Array, "z"], x0: Float[Array, "x"], ref: Signals
     ) -> Float[Array, "u"]:
         # roll foward for warm start and preflatten
         ut_flat = jnp.roll(self.ut.value, -1).at[-1].set(self.ut.value[-1]).flatten()
 
-        # optimization objective (either deterministic or monte carlo estimation)
+        # optimization objective
         def cost_fn(ut_flat):
-            def cost_single_sim(ut, wt):
-                zt, xt, yt = self.sys.trajectory(z0, x0, ut, wt)
-                cost_t = self.control_cost(zt, xt, ut, yt, ref, u0=self.ut[0])
-                return jnp.sum(cost_t * self.discount ** jnp.arange(self.horizon))
-
             ut = ut_flat.reshape(self.ut.shape)
-            if not self.mc_samples_traj:
-                return cost_single_sim(ut, wt=None)
-
-            rngs = jr.split(self.rngs(), self.mc_samples_traj * len(self.ut))
-            wt = jax.vmap(self.sys.sample_w)(rngs)
-            wt = wt.reshape(self.mc_samples_traj, len(self.ut), -1)
-            return jnp.mean(jax.vmap(cost_single_sim, in_axes=(None, 0))(ut, wt))
+            if self.integral_action:
+                ut = ut.at[1:].add(-ut[:-1]).at[0].add(-self.ut[0])
+            zt, xt, yt = self.sys.trajectory(z0, x0, ut, wt=None)
+            cost_t = self.control_cost(zt, xt, ut, yt, ref)
+            return jnp.sum(cost_t * self.discount ** jnp.arange(self.horizon))
 
         # second order optimization
         for _ in range(self.newton_iters):
@@ -94,13 +76,10 @@ class MPC(nnx.Module):
         xt: Float[Array, "t x"],
         ut: Float[Array, "t u"],
         yt: Float[Array, "t y"],
-        ref: References,
-        u0: Float[Array, "u"] = jnp.zeros(()),
+        ref: Signals,
     ) -> Float[Array, "t"]:
-        dut = ut.at[1:].add(-ut[:-1]).at[0].add(-u0)
         cy = quadratic_cost(yt - ref.y, self.J.value.y)
         cu = quadratic_cost(ut - ref.u, self.J.value.u)
-        cdu = quadratic_cost(dut, self.J.value.du)
         cx = quadratic_cost(xt - ref.x, self.J.value.x)
         cz = quadratic_cost(zt - ref.z, self.J.value.z)
-        return cy + cu + cx + cz + cdu
+        return cy + cu + cx + cz
