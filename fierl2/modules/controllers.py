@@ -17,6 +17,15 @@ class ControlCostMatrices(NamedTuple):
     z: Float[Array, "z z"] | Float[Array, "z"] | float
 
 
+def quadratic_cost(
+    s: Float[Array, "... d"], J: Float[Array, "d d"] | Float[Array, "d"] | float
+) -> Float[Array, ""]:
+    J = jnp.asarray(J)
+    if J.ndim == 2:
+        return jnp.einsum("...i, ij, ...j->...", s, J, s)
+    return jnp.sum(J * s**2, axis=-1)
+
+
 class MPC(nnx.Module):
     def __init__(
         self,
@@ -53,33 +62,22 @@ class MPC(nnx.Module):
         # optimization objective
         def cost_fn(ut_flat):
             ut = ut_flat.reshape(self.ut.shape)
-            if self.integral_action:
-                ut = ut.at[1:].add(-ut[:-1]).at[0].add(-self.ut[0])
             zt, xt, yt = self.sys.trajectory(z0, x0, ut, wt=None)
-            cost_t = self.control_cost(zt, xt, ut, yt, ref)
-            return jnp.sum(cost_t * self.discount ** jnp.arange(self.horizon))
+
+            ref_u = self.ut.value if self.integral_action else ref.u
+            cy = quadratic_cost(yt - ref.y, self.J.value.y)
+            cu = quadratic_cost(ut - ref_u, self.J.value.u)
+            cx = quadratic_cost(xt - ref.x, self.J.value.x)
+            cz = quadratic_cost(zt - ref.z, self.J.value.z)
+            costs = cy + cu + cx + cz
+            return jnp.sum(costs * self.discount ** jnp.arange(self.horizon))
 
         # second order optimization
         for _ in range(self.newton_iters):
-            H = jax.hessian(cost_fn)(ut_flat) + 1e-8 * jnp.eye(len(ut_flat))
+            H = jax.hessian(cost_fn)(ut_flat)
             J = jax.grad(cost_fn)(ut_flat)
             ut_flat = jnp.linalg.solve(a=H, b=H @ ut_flat - J)
-            ut_flat = ut_flat.clip(*self.u_range)
 
-        self.ut.value = ut_flat.reshape(*self.ut.shape)
+        self.ut.value = ut_flat.clip(*self.u_range).reshape(*self.ut.shape)
         u = self.ut.value[0]
         return u
-
-    def control_cost(
-        self,
-        zt: Float[Array, "t z"],
-        xt: Float[Array, "t x"],
-        ut: Float[Array, "t u"],
-        yt: Float[Array, "t y"],
-        ref: Signals,
-    ) -> Float[Array, "t"]:
-        cy = quadratic_cost(yt - ref.y, self.J.value.y)
-        cu = quadratic_cost(ut - ref.u, self.J.value.u)
-        cx = quadratic_cost(xt - ref.x, self.J.value.x)
-        cz = quadratic_cost(zt - ref.z, self.J.value.z)
-        return cy + cu + cx + cz

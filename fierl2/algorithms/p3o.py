@@ -1,7 +1,14 @@
-from tqdm import tqdm
+from typing import NamedTuple, Any, Protocol
+from jaxtyping import Float, Array, Key
+import jax
+import jax.numpy as jnp
+import jax.random as jr
+
 from flax import nnx
 import optax
-from utils import *
+from tqdm import tqdm
+from env import Simulator
+import utils
 
 
 class Trainer(nnx.Module):
@@ -9,8 +16,8 @@ class Trainer(nnx.Module):
         self,
         env,
         max_cost: float = 0.0,
-        discount: float = 0.9,
-        gae_lambda: float = 0.9,
+        discount: float = 0.99,
+        gae_lambda: float = 0.95,
         clip_pi: float = 0.3,
         clip_vf: float = 1.0,
         cost_weight: float = 20.0,
@@ -31,9 +38,9 @@ class Trainer(nnx.Module):
 
         self.rngs = rngs
         self.env = env
-        self.value_fn = MLP(env.obs_dim, 1, rngs=self.rngs)
-        self.cvalue_fn = MLP(env.obs_dim, 1, rngs=self.rngs)
-        self.policy = GaussianPolicy(
+        self.value_fn = utils.MLP(env.obs_dim, 1, rngs=self.rngs)
+        self.cvalue_fn = utils.MLP(env.obs_dim, 1, rngs=self.rngs)
+        self.policy = utils.GaussianPolicy(
             env.obs_dim, env.a_dim, **policy_params, rngs=self.rngs
         )
 
@@ -49,7 +56,7 @@ class Trainer(nnx.Module):
         optimizer_vf = nnx.Optimizer(self.value_fn, optax.adamw(lr, weight_decay=wd))
         optimizer_cvf = nnx.Optimizer(self.cvalue_fn, optax.adamw(lr, weight_decay=wd))
 
-        logger = Logger()
+        logger = utils.Logger()
         for i in (pbar := tqdm(range(epochs))):
             rollouts = self.get_rollouts(pool_size, episode_length)
             V, A, Vc, Ac, violation = self.estimate_returns_and_advantages(rollouts)
@@ -89,27 +96,24 @@ class Trainer(nnx.Module):
         @nnx.split_rngs(splits=pool_size)
         @nnx.vmap(in_axes=(map_axes, map_axes))
         def rollouts(env, policy):
-            rollout, outs = env.rollout(policy, episode_length)
+            rollout, infos = utils.get_rollout(env, policy, episode_length)
             return rollout
 
         steps = rollouts(make_pool(self.env), make_pool(self.policy))
         return steps
 
     @nnx.jit
-    def estimate_returns_and_advantages(self, rollouts, last_is_done=True):
+    def estimate_returns_and_advantages(self, rollouts):
         @nnx.vmap(in_axes=(None, 0, 0))
         def gae_estimate(vf, obs, signal):
             V = jax.vmap(vf)(obs).squeeze(-1)
-            if last_is_done:
-                V = V.at[-1].set(0.0)
-            delta = signal - V[:-1] + self.discount * V[1:]
-            A = get_returns(delta, self.discount * self.gae_lambda)
-            V = V[:-1] + A
+            delta = (signal - V).at[:-1].add(self.discount * V[1:])
+            A = utils.get_returns(delta, self.discount * self.gae_lambda)
+            V = V + A
             return V, A
 
-        obs = jnp.concat([rollouts.obs, rollouts.next_obs[:, -1:]], axis=1)
-        V, A = gae_estimate(self.value_fn, obs, rollouts.r)
-        Vc, Ac = gae_estimate(self.cvalue_fn, obs, rollouts.c)
+        V, A = gae_estimate(self.value_fn, rollouts.obs, rollouts.r)
+        Vc, Ac = gae_estimate(self.cvalue_fn, rollouts.obs, rollouts.c)
         violation = (1 - self.discount) * (Vc[:, 0].mean() - self.max_cost)
 
         if self.normalize_advantages:
@@ -123,7 +127,7 @@ class Trainer(nnx.Module):
     def policy_optimization_step(
         self,
         optimizer: nnx.Optimizer,
-        rollouts: Rollout,
+        rollouts: utils.Rollout,
         A: Float[Array, "n t"],
         Ac: Float[Array, "n t"],
         violation: Float[Array, ""],
@@ -132,7 +136,7 @@ class Trainer(nnx.Module):
         def loss(policy):
             log_p, entropy = jax.vmap(jax.vmap(policy.eval))(rollouts.obs, rollouts.a)
             ratio = jnp.exp(log_p - rollouts.log_p)
-            ratio_clip = 1 + tanh_clip(ratio - 1, self.clip_pi)
+            ratio_clip = 1 + utils.tanh_clip(ratio - 1, self.clip_pi)
 
             # cost surrogate loss
             gained_c = jnp.maximum(Ac * ratio, Ac * ratio_clip).mean()

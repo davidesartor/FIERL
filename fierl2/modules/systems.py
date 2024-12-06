@@ -97,7 +97,7 @@ class Cascade(FDSSM):
     def sample_x(self, rng: Key | None):
         x = jnp.ones((self.x_dim,)) / self.flow_coeff
         if rng is not None:
-            x = x * jr.uniform(rng, x.shape, minval=0.9, maxval=1.1)
+            x = x * jr.uniform(rng, x.shape, minval=0.0, maxval=1.1)
         return x
 
     def sample_w(self, rng: Key | None):

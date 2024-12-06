@@ -75,15 +75,6 @@ class Logger(dict):
         return {key: jnp.array(value) for key, value in self.items()}
 
 
-class Rollout(NamedTuple):
-    obs: Float[Array, "..."]
-    a: Float[Array, "u"]
-    log_p: Float[Array, ""]
-    r: Float[Array, ""]
-    next_obs: Float[Array, "..."]
-    c: Float[Array, ""] = jnp.zeros(())
-
-
 def get_returns(r: Float[Array, "t"], discount: float) -> Float[Array, "t"]:
     def accumulate(v, ri):
         v = ri + discount * v
@@ -93,15 +84,32 @@ def get_returns(r: Float[Array, "t"], discount: float) -> Float[Array, "t"]:
     return Jt
 
 
-def quadratic_cost(
-    s: Float[Array, "t d"], J: Float[Array, "d d"] | Float[Array, "d"] | float
-) -> Float[Array, "t"]:
-    J = jnp.asarray(J)
-    if J.ndim == 2:
-        return jnp.einsum("ti, ij, tj->t", s, J, s)
-    return jnp.sum(J * s**2, axis=-1)
-
-
 def tanh_clip(x: Float[Array, "..."], neg: float, pos: float | None = None):
     c = jnp.where(x < 0.0, neg, pos or neg)
     return jnp.tanh(x / c) * c
+
+
+class Rollout(NamedTuple):
+    obs: Float[Array, "..."]
+    a: Float[Array, "u"]
+    log_p: Float[Array, ""]
+    r: Float[Array, ""]
+    c: Float[Array, ""] = jnp.zeros(())
+
+
+@nnx.jit(static_argnames=("episode_length",))
+def get_rollout(env, policy, episode_length: int) -> tuple[Rollout, dict]:
+    @nnx.scan(in_axes=nnx.Carry, out_axes=(nnx.Carry, 0, 0), length=episode_length)
+    def scan_rollout(carry):
+        env, policy = carry
+        obs = env.obs()
+        if policy is not None:
+            action, log_p = policy.sample(obs)
+        else:
+            action, log_p = jnp.zeros(env.a_dim), jnp.zeros(())
+        reward, cost, info = env.step(action)
+        return (env, policy), Rollout(obs, action, log_p, reward, cost), info
+
+    env.reset()
+    (env, policy), rollout, infos = scan_rollout((env, policy))
+    return rollout, infos
