@@ -1,14 +1,8 @@
-from typing import NamedTuple, Any, Protocol
-from jaxtyping import Float, Array, Key
-import jax
-import jax.numpy as jnp
-import jax.random as jr
-
+from utils import *
 from modules.systems import FDSSM, SysModule
-from modules.controllers import MPC, ControlCostMatrices, Signals, quadratic_cost
+from modules.controllers import MPC, ControlCostMatrices, References
 from modules.observers import ExtendedKalmanFilter
 from flax import nnx
-import utils
 
 
 class AuxCostMatrices(NamedTuple):
@@ -17,61 +11,27 @@ class AuxCostMatrices(NamedTuple):
     x: Float[Array, "x x"] | Float[Array, "x"] | float
 
 
-class EOGReward(nnx.Module):
-    def __init__(self, sys: FDSSM, eps: float, *, rngs: nnx.Rngs):
-        self.sys = sys
-        self.rngs = rngs
-        self.eps = eps
-        self.zs = nnx.Variable(jnp.zeros((2 * sys.z_dim, sys.z_dim)))
-        self.xs = nnx.Variable(jnp.zeros((2 * sys.z_dim, sys.x_dim)))
-        self.gramian = nnx.Variable(jnp.zeros((sys.z_dim, sys.z_dim)))
-        self.determinant = nnx.Variable(jnp.linalg.det(self.gramian.value))
-
-    def reset(self, z: Float[Array, "z"], x: Float[Array, "x"]):
-        n = self.sys.z_dim
-        Eps = jnp.eye(n) * self.eps
-        self.gramian.value = jnp.zeros_like(self.gramian.value)
-        self.xs.value = jnp.broadcast_to(x, self.xs.shape)
-        self.zs.value = (
-            jnp.broadcast_to(z, self.zs.shape).at[:n].add(Eps).at[n:].add(-Eps)
-        )
-
-    def step(self, u: Float[Array, "u"]):
-        step = jax.vmap(lambda z, x: self.sys(z, x, u, w=None))
-        zs, xs = self.zs.value, self.xs.value
-        zs, xs, ys = step(zs, xs)
-        self.zs.value, self.xs.value = zs, xs
-
-        yp, ym = jnp.split(ys, 2)
-        self.gramian.value += (yp - ym) @ (yp - ym).T
-        new_determinant = jnp.linalg.det(self.gramian.value)
-        reward = new_determinant - self.determinant.value
-        self.determinant.value = new_determinant
-        return reward
-
-
 class Simulator(nnx.Module):
     def __init__(
         self,
         sys: FDSSM,
-        t_aux_on: int,
-        t_aux_off: int,
-        ref=Signals(y=1.0, u=0.0, x=0.0, z=0.0),
+        t_aux_on: int = 0,
+        t_aux_off: int = -1,
+        ref=References(y=1.0, u=0.0, x=0.0, z=0.0),
         Jcontrol=ControlCostMatrices(y=1.0, u=1.0, x=0.0, z=0.0),
-        Jaux=AuxCostMatrices(a=0.1, z=1.0, x=0.0),
-        reward_type: str = "quadratic",
+        Jaux=AuxCostMatrices(a=1.0, z=1.0, x=0.0),
         epsilon: float = 1e-2,
-        kalman_params: dict = dict(Qz=1e-8, Qx=1e-2, R=1e-2),
-        mpc_params: dict = dict(
-            horizon=16, discount=0.9, newton_iters=1, integral_action=True
-        ),
+        reward_type: str = "EOG",
+        kalman_params: dict = dict(Qz=1e-8, Qx=1e-2, R=1e-2, mc_samples_init=16),
+        mpc_params: dict = dict(horizon=16, discount=0.9, mc_samples_traj=0),
         *,
         rngs: nnx.Rngs,
     ):
         # sim params and state
-        self.reward_type = reward_type
         self.t_aux_on = t_aux_on
         self.t_aux_off = t_aux_off
+        self.reward_type = reward_type
+        self.epsilon = epsilon
 
         # costs and references
         self.ref = nnx.Param(ref)
@@ -81,11 +41,13 @@ class Simulator(nnx.Module):
         # modules and state
         self.rngs = rngs
         self.t = nnx.Variable(0)
-
         self.sys = SysModule(sys, rngs=rngs)
-        self.mpc = MPC(sys, Jcontrol, **mpc_params)
-        self.kalman = ExtendedKalmanFilter(sys, **kalman_params)
-        self.reward_generator = EOGReward(sys, eps=epsilon, rngs=rngs)
+
+        self.sys_plus_eps = [SysModule(sys, rngs=rngs) for _ in range(sys.z_dim)]
+        self.sys_minus_eps = [SysModule(sys, rngs=rngs) for _ in range(sys.z_dim)]
+
+        self.mpc = MPC(sys, Jcontrol, **mpc_params, rngs=rngs)
+        self.kalman = ExtendedKalmanFilter(sys, **kalman_params, rngs=rngs)
 
     @property
     def obs_dim(self):
@@ -97,53 +59,122 @@ class Simulator(nnx.Module):
 
     def reset(self):
         self.t.value = 0
-        self.sys.reset()
-        self.mpc.reset()
-        self.kalman.reset()
-        self.reward_generator.reset(self.sys.z.value, self.sys.x.value)
+        self.sys.reset(deterministic=False)
+        self.mpc.reset(deterministic=True)
+        self.kalman.reset(deterministic=True)
+
+        for i, sys in enumerate(self.sys_plus_eps):
+            sys.reset(deterministic=True)
+            sys.z.value = self.sys.z.value.at[i].add(self.epsilon)
+        for i, sys in enumerate(self.sys_minus_eps):
+            sys.reset(deterministic=True)
+            sys.z.value = self.sys.z.value.at[i].add(-self.epsilon)
 
     def obs(self) -> Float[Array, "..."]:
         t = jnp.array([self.t.value])
         return jnp.concat([t, self.kalman.flat_state()], axis=-1)
 
-    def step(self, a: Float[Array, "u"]):
+    def step(self, a: Float[Array, "u"] | None):
         # return initial state as info
-        ut_prev = self.mpc.ut.value
         z, x = self.sys.z.value, self.sys.x.value  # hidden state
         z_hat, x_hat = (self.kalman.z.value, self.kalman.x.value)
         P = self.kalman.P.value
 
         # the actual simulation step
         u = self.mpc.step(z0=z_hat, x0=x_hat, ref=self.ref.value)
-        utot = u + a * (self.t.value >= self.t_aux_on) * (self.t.value < self.t_aux_off)
+        a = a if a is not None else jnp.zeros_like(u)
+        utot = u + a
         y = self.sys.step(utot)
+        yp = [sys.step(utot) for sys in self.sys_plus_eps]
+        ym = [sys.step(utot) for sys in self.sys_minus_eps]
         self.kalman.step(utot, y)
         self.t.value += 1
+        return dict(
+            z=z, x=x, z_hat=z_hat, x_hat=x_hat, P=P, u=u, a=a, y=y, yp=yp, ym=ym
+        )
 
-        # compute reward and cost
-        info = dict(z=z, x=x, z_hat=z_hat, x_hat=x_hat, P=P, u=u, a=a, y=y)
-        if self.reward_type == "quadratic":
-            reward = -(
-                +quadratic_cost(z_hat - z, self.Jaux.value.z)
-                + quadratic_cost(x_hat - x, self.Jaux.value.x)
+    def rewards(self, outs: dict):
+        zt, xt, zt_hat, xt_hat, yp, ym = (
+            outs[k] for k in ["z", "x", "z_hat", "x_hat", "yp", "ym"]
+        )
+        if self.reward_type == "EOG":
+            dy = jnp.stack([yp - ym for yp, ym in zip(yp, ym)])
+            noise_prec = jnp.linalg.inv(self.kalman.R.value)
+            empirical_obs_gramian = jnp.cumsum(
+                jnp.einsum("...ita,...jtb, ab->...tij", dy, dy, noise_prec), axis=0
             )
+            det_G = jnp.linalg.det(empirical_obs_gramian)
+            reward = det_G.at[1:].add(-det_G[:-1])
         else:
-            reward = self.reward_generator.step(utot)
+            reward = -(
+                +quadratic_cost(zt_hat - zt, self.Jaux.value.z)
+                + quadratic_cost(xt_hat - xt, self.Jaux.value.x)
+            )
+        return reward
 
-        ref_u = ut_prev[0] if self.mpc.integral_action else self.ref.u
-        cy = quadratic_cost(y - self.ref.y, self.Jcontrol.value.y)
-        cu = quadratic_cost(u - ref_u, self.Jcontrol.value.u)
-        cx = quadratic_cost(x - self.ref.x, self.Jcontrol.value.x)
-        cz = quadratic_cost(z - self.ref.z, self.Jcontrol.value.z)
-        ca = quadratic_cost(a, self.Jaux.value.a)
-        cost = cy + cu + cx + cz + ca
-        return reward, cost, info
+    def costs(self, outs: dict):
+        zt, xt, ut, at, yt = (outs[k] for k in ["z", "x", "u", "a", "y"])
 
-    def render(self, infos: dict, title=""):
+        ref_u = self.ref.u
+        if self.mpc.integral_action:
+            ref_u = jnp.roll(ut, 1).at[0].set(self.ref.u)
+
+        cost = (
+            +quadratic_cost(yt - self.ref.y, self.Jcontrol.value.y)
+            + quadratic_cost(ut - ref_u, self.Jcontrol.value.u)
+            + quadratic_cost(xt - self.ref.x, self.Jcontrol.value.x)
+            + quadratic_cost(zt - self.ref.z, self.Jcontrol.value.z)
+            + quadratic_cost(at, self.Jaux.value.a)
+        )
+        return cost
+
+    @nnx.jit(static_argnames=("episode_length",))
+    def rollout(self, policy, episode_length: int) -> tuple[Rollout, dict]:
+        @nnx.scan
+        def aux_off_step(env, i):
+            out = env.step(a=None)
+            return env, out
+
+        @nnx.scan
+        def aux_on_step(carry, i):
+            env, policy = carry
+            obs = env.obs()
+            a, log_p = policy.sample(obs)
+            out = env.step(a)
+            return (env, policy), (obs, a, log_p, out)
+
+        self.reset()
+        if policy is None:
+            self, outs = aux_off_step(self, jnp.arange(episode_length))
+            return None, outs  # type: ignore
+
+        Ton = (self.t_aux_on + episode_length) % episode_length
+        Toff = (self.t_aux_off + episode_length) % episode_length
+
+        # phase 1: aux off
+        T1 = jnp.arange(0, Ton)
+        self, outs1 = aux_off_step(self, T1)
+
+        # phase 2: aux on
+        T2 = jnp.arange(Ton, Toff)
+        (self, policy), (obs, a, log_p, outs2) = aux_on_step((self, policy), T2)
+        next_obs = jnp.roll(obs, -1).at[-1].set(self.obs())
+        rewards = self.rewards(outs2)
+        costs = self.costs(outs2)
+
+        # phase 3: aux off
+        T3 = jnp.arange(Toff, episode_length)
+        self, outs3 = aux_off_step(self, T3)
+
+        rollout = Rollout(obs, a, log_p, rewards, next_obs, costs)
+        outs = jax.tree.map(lambda *x: jnp.concat(x), outs1, outs2, outs3)
+        return rollout, outs
+
+    def render(self, outs: dict, title=""):
         import matplotlib.pyplot as plt
 
         z, x, z_hat, x_hat, P, u, a, y = (
-            infos[k] for k in ["z", "x", "z_hat", "x_hat", "P", "u", "a", "y"]
+            outs[k] for k in ["z", "x", "z_hat", "x_hat", "P", "u", "a", "y"]
         )
         ref_y = jnp.broadcast_to(self.ref.y, y.shape)
         ref_u = jnp.broadcast_to(self.ref.u, u.shape)

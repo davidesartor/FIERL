@@ -10,7 +10,7 @@ class Trainer(nnx.Module):
         env,
         discount: float = 0.99,
         gae_lambda: float = 0.95,
-        clip_pi: float = 0.3,
+        clip_pi: float = 0.1,
         clip_vf: float = 1.0,
         entropy_weight: float = 0.0001,
         normalize_advantages: bool = True,

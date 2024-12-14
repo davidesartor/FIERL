@@ -10,8 +10,12 @@ class ExtendedKalmanFilter(nnx.Module):
         Qz: Float[Array, "z z"] | Float[Array, "z"] | float,
         Qx: Float[Array, "x x"] | Float[Array, "x"] | float,
         R: Float[Array, "y y"] | Float[Array, "y"] | float,
+        mc_samples_init: int = 16,
+        *,
+        rngs: nnx.Rngs,
     ):
         self.sys = sys
+        self.mc_samples_init = mc_samples_init
         Zeros = jnp.zeros((sys.z_dim, sys.x_dim))
         Q = [
             [jnp.eye(sys.z_dim) * Qz, Zeros],
@@ -20,14 +24,23 @@ class ExtendedKalmanFilter(nnx.Module):
         self.Q = nnx.Param(jnp.block(Q))
         self.R = nnx.Param(jnp.eye(sys.y_dim) * R)
 
+        self.rngs = rngs
         self.z = nnx.Variable(jnp.zeros((sys.z_dim,)))
         self.x = nnx.Variable(jnp.zeros((sys.x_dim,)))
         self.P = nnx.Variable(jnp.eye(sys.z_dim + sys.x_dim))
 
-    def reset(self):
-        self.z.value = self.sys.sample_z(rng=None)
-        self.x.value = self.sys.sample_x(rng=None)
-        self.P.value = jnp.eye(self.P.value.shape[-1])
+    def reset(self, deterministic=False):
+        if deterministic:
+            self.z.value = self.sys.sample_z(rng=None)
+            self.x.value = self.sys.sample_x(rng=None)
+            self.P.value = jnp.eye(self.P.value.shape[-1])
+        else:
+            z = jax.vmap(self.sys.sample_z)(jr.split(self.rngs(), self.mc_samples_init))
+            x = jax.vmap(self.sys.sample_x)(jr.split(self.rngs(), self.mc_samples_init))
+            self.z.value = jnp.mean(z, axis=0)
+            self.x.value = jnp.mean(x, axis=0)
+            x_aug = jnp.concatenate([z, x], axis=-1)
+            self.P.value = jnp.cov(x_aug.T)
 
     def flat_state(self):
         x_aug = jnp.concatenate([self.z.value, self.x.value], axis=-1)

@@ -38,17 +38,15 @@ class GaussianPolicy(nnx.Module):
             if variable_mu
             else nnx.Param(jnp.zeros((a_dim,)))
         )
-        self.std = nnx.Param(jnp.ones((a_dim,)))
-        self.corr = nnx.Param(jnp.zeros((a_dim, a_dim))) if correlations else None
+        self.std = nnx.Param(jnp.eye(a_dim) if correlations else jnp.ones((a_dim,)))
 
     def __call__(self, obs: Float[Array, "o"]):
         mu = self.mu(obs) if isinstance(self.mu, MLP) else self.mu.value
-        cov = jnp.diag(self.std**2 + 1e-8)
-        if self.corr is not None:
-            # cayley parameterization for orthogonal matrix
-            A = self.corr.value - self.corr.value.T  # skew-symmetric matrix
-            Q = (jnp.eye(len(mu)) - A / 2) @ jnp.linalg.inv(jnp.eye(len(mu)) + A / 2)
-            cov = Q @ cov @ Q.T
+        cov = (
+            jnp.diag(self.std**2 + 1e-8)
+            if self.std.ndim == 1
+            else self.std @ self.std.T + 1e-8 * jnp.eye(mu.shape[-1])
+        )
         return mu, cov
 
     def sample(self, obs: Float[Array, "o"]):
@@ -75,6 +73,15 @@ class Logger(dict):
         return {key: jnp.array(value) for key, value in self.items()}
 
 
+class Rollout(NamedTuple):
+    obs: Float[Array, "..."]
+    a: Float[Array, "u"]
+    log_p: Float[Array, ""]
+    r: Float[Array, ""]
+    next_obs: Float[Array, "..."]
+    c: Float[Array, ""] = jnp.zeros(())
+
+
 def get_returns(r: Float[Array, "t"], discount: float) -> Float[Array, "t"]:
     def accumulate(v, ri):
         v = ri + discount * v
@@ -84,32 +91,15 @@ def get_returns(r: Float[Array, "t"], discount: float) -> Float[Array, "t"]:
     return Jt
 
 
+def quadratic_cost(
+    s: Float[Array, "... d"], J: Float[Array, "d d"] | Float[Array, "d"] | float
+) -> Float[Array, "..."]:
+    J = jnp.asarray(J)
+    if J.ndim == 2:
+        return jnp.einsum("...i, ij, ...j->...", s, J, s)
+    return jnp.sum(J * s**2, axis=-1)
+
+
 def tanh_clip(x: Float[Array, "..."], neg: float, pos: float | None = None):
     c = jnp.where(x < 0.0, neg, pos or neg)
     return jnp.tanh(x / c) * c
-
-
-class Rollout(NamedTuple):
-    obs: Float[Array, "..."]
-    a: Float[Array, "u"]
-    log_p: Float[Array, ""]
-    r: Float[Array, ""]
-    c: Float[Array, ""] = jnp.zeros(())
-
-
-@nnx.jit(static_argnames=("episode_length",))
-def get_rollout(env, policy, episode_length: int) -> tuple[Rollout, dict]:
-    @nnx.scan(in_axes=nnx.Carry, out_axes=(nnx.Carry, 0, 0), length=episode_length)
-    def scan_rollout(carry):
-        env, policy = carry
-        obs = env.obs()
-        if policy is not None:
-            action, log_p = policy.sample(obs)
-        else:
-            action, log_p = jnp.zeros(env.a_dim), jnp.zeros(())
-        reward, cost, info = env.step(action)
-        return (env, policy), Rollout(obs, action, log_p, reward, cost), info
-
-    env.reset()
-    (env, policy), rollout, infos = scan_rollout((env, policy))
-    return rollout, infos
