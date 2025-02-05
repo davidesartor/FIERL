@@ -7,19 +7,29 @@ from jax.scipy.stats import multivariate_normal
 from flax import nnx
 
 
-class MLP(nnx.Sequential):
-    def __init__(self, in_dim, out_dim, hidden_dim=32, *, rngs: nnx.Rngs):
-        super().__init__(
-            nnx.Linear(in_dim, hidden_dim, rngs=rngs),
-            nnx.gelu,
-            nnx.RMSNorm(hidden_dim, rngs=rngs),
-            nnx.Linear(hidden_dim, hidden_dim, rngs=rngs),
-            nnx.gelu,
-            nnx.RMSNorm(hidden_dim, rngs=rngs),
-            nnx.Linear(
-                hidden_dim, out_dim, rngs=rngs, kernel_init=nnx.initializers.zeros
-            ),
+class PickableLinear(nnx.Linear):
+    # make the module pickable
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.kernel_init = None
+        self.bias_init = None
+
+
+class MLP(nnx.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim, *, rngs: nnx.Rngs):
+        self.lin1 = PickableLinear(in_dim, hidden_dim, rngs=rngs)
+        self.norm1 = nnx.RMSNorm(hidden_dim, rngs=rngs)
+        self.lin2 = PickableLinear(hidden_dim, hidden_dim, rngs=rngs)
+        self.norm2 = nnx.RMSNorm(hidden_dim, rngs=rngs)
+        self.lin3 = PickableLinear(
+            hidden_dim, out_dim, rngs=rngs, kernel_init=nnx.initializers.zeros
         )
+
+    def __call__(self, x):
+        x = jax.nn.silu(self.lin1(x))
+        x = jax.nn.silu(self.lin2(self.norm1(x)))
+        x = self.lin3(self.norm2(x))
+        return x
 
 
 class GaussianPolicy(nnx.Module):
@@ -27,26 +37,25 @@ class GaussianPolicy(nnx.Module):
         self,
         obs_dim: int,
         a_dim: int,
-        variable_mu=True,
-        correlations=False,
+        hidden_dim: int,
+        stationary=False,
         *,
         rngs: nnx.Rngs,
     ):
         self.rngs = rngs
         self.mu = (
-            MLP(obs_dim, a_dim, rngs=rngs)
-            if variable_mu
+            MLP(obs_dim, hidden_dim, a_dim, rngs=rngs)
+            if not stationary
             else nnx.Param(jnp.zeros((a_dim,)))
         )
-        self.std = nnx.Param(jnp.eye(a_dim) if correlations else jnp.ones((a_dim,)))
+        self.std = nnx.Param(jnp.eye(a_dim) if stationary else jnp.ones((a_dim,)))
 
     def __call__(self, obs: Float[Array, "o"]):
         mu = self.mu(obs) if isinstance(self.mu, MLP) else self.mu.value
-        cov = (
-            jnp.diag(self.std**2 + 1e-8)
-            if self.std.ndim == 1
-            else self.std @ self.std.T + 1e-8 * jnp.eye(mu.shape[-1])
-        )
+        std = self.std.value
+        if self.std.ndim == 1:
+            std = jnp.diag(std)
+        cov = std @ std.T + 1e-8 * jnp.eye(mu.shape[-1])
         return mu, cov
 
     def sample(self, obs: Float[Array, "o"]):
@@ -80,6 +89,25 @@ class Rollout(NamedTuple):
     r: Float[Array, ""]
     next_obs: Float[Array, "..."]
     c: Float[Array, ""] = jnp.zeros(())
+
+
+@nnx.jit(static_argnames=("pool_size"))
+def get_rollouts(env, policy, pool_size: int):
+    def make_pool(m: nnx.Module):
+        graph, rng, par, var = nnx.split(m, nnx.RngState, nnx.Param, nnx.Variable)
+        var = jax.tree_map(lambda x: jnp.stack([x] * pool_size), var)
+        return nnx.merge(graph, rng, par, var)
+
+    map_axes = nnx.StateAxes({nnx.Param: None, (nnx.RngState, nnx.Variable): 0})
+
+    @nnx.split_rngs(splits=pool_size)
+    @nnx.vmap(in_axes=(map_axes, map_axes))
+    def rollouts(env, policy):
+        rollout, outs = env.rollout(policy)
+        return rollout, outs
+
+    steps, outs = rollouts(make_pool(env), make_pool(policy))
+    return steps, outs
 
 
 def get_returns(r: Float[Array, "t"], discount: float) -> Float[Array, "t"]:

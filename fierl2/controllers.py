@@ -1,4 +1,4 @@
-from .systems import FDSSM
+from systems import FDSSM
 from utils import *
 from flax import nnx
 
@@ -6,6 +6,7 @@ from flax import nnx
 class References(NamedTuple):
     y: Float[Array, "t y"] | Float[Array, "y"] | Float[Array, ""] | float
     u: Float[Array, "t u"] | Float[Array, "u"] | Float[Array, ""] | float
+    a: Float[Array, "t u"] | Float[Array, "u"] | Float[Array, ""] | float
     x: Float[Array, "t x"] | Float[Array, "x"] | Float[Array, ""] | float
     z: Float[Array, "t z"] | Float[Array, "z"] | Float[Array, ""] | float
 
@@ -13,6 +14,7 @@ class References(NamedTuple):
 class ControlCostMatrices(NamedTuple):
     y: Float[Array, "y y"] | Float[Array, "y"] | float
     u: Float[Array, "u u"] | Float[Array, "u"] | float
+    a: Float[Array, "u u"] | Float[Array, "u"] | float
     x: Float[Array, "x x"] | Float[Array, "x"] | float
     z: Float[Array, "z z"] | Float[Array, "z"] | float
 

@@ -58,9 +58,10 @@ class SysModule(nnx.Module):
         self.z.value = self.sys.sample_z(rng=None if deterministic else self.rngs())
         self.x.value = self.sys.sample_x(rng=None if deterministic else self.rngs())
 
-    def step(self, u: Float[Array, "u"]):
+    def step(self, u: Float[Array, "u"], *, w: Float[Array, "w"] | None = None):
         z, x = self.z.value, self.x.value
-        w = self.sys.sample_w(rng=self.rngs())
+        if w is None:
+            w = self.sys.sample_w(rng=self.rngs())
         z, x, y = self.sys(z, x, u, w)
         self.z.value, self.x.value = z, x
         return y
@@ -91,7 +92,7 @@ class Cascade(FDSSM):
         z = jnp.ones(self.z_dim)
         if rng is not None:
             rng, rng_idx, rng_val = jr.split(rng, 3)
-            z = z.at[jr.choice(rng_idx, len(z))].set(jr.uniform(rng_val))
+            z = z.at[jr.choice(rng_idx, len(z))].set(jr.uniform(rng_val) ** 2)
         return z
 
     def sample_x(self, rng: Key | None):

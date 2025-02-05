@@ -1,9 +1,9 @@
-from .systems import FDSSM
+from systems import FDSSM
 from utils import *
 from flax import nnx
 
 
-class ExtendedKalmanFilter(nnx.Module):
+class EKF(nnx.Module):
     def __init__(
         self,
         sys: FDSSM,
@@ -72,7 +72,7 @@ class ExtendedKalmanFilter(nnx.Module):
         return self.z.value, self.x.value
 
 
-class UnscentedKalmanFilter(nnx.Module):
+class UKF(nnx.Module):
     def __init__(
         self,
         sys: FDSSM,
